@@ -18,6 +18,7 @@ export function useZoomSdk() {
   const [meetingContext, setMeetingContext] = useState(null);
   const [userContext, setUserContext] = useState(null);
   const [isHost, setIsHost] = useState(false);
+  const [roleCheckCount, setRoleCheckCount] = useState(0);
 
   // Initialize SDK
   useEffect(() => {
@@ -46,13 +47,35 @@ export function useZoomSdk() {
         try {
           const user = await zoomSdk.getUserContext();
           setUserContext(user);
-          // Check for various role formats
-          const role = (user.role || '').toLowerCase();
-          setIsHost(role === 'host' || role === 'cohost' || role === 'co-host');
-          console.log('User context:', user);
-          console.log('User role:', user.role, '-> isHost:', role === 'host' || role === 'cohost' || role === 'co-host');
+
+          // Debug: log ALL user fields to see what Zoom returns
+          console.log('=== USER CONTEXT DEBUG ===');
+          console.log('Full user object:', JSON.stringify(user, null, 2));
+          console.log('user.role:', user.role);
+          console.log('user.userRole:', user.userRole);
+          console.log('user.status:', user.status);
+          console.log('user.participantRole:', user.participantRole);
+
+          // Check for various role formats and fields
+          const role = String(user.role || user.userRole || user.participantRole || '').toLowerCase();
+          const isHostOrCohost =
+            role === 'host' ||
+            role === 'cohost' ||
+            role === 'co-host' ||
+            role === 'coHost' ||
+            role.includes('host') ||  // catch any variation
+            user.role === 1 ||  // some SDKs use numeric
+            user.role === 2 ||
+            user.userRole === 1 ||
+            user.userRole === 2;
+
+          setIsHost(isHostOrCohost);
+          console.log('Detected role:', role, '-> isHost:', isHostOrCohost);
         } catch (e) {
           console.log('Could not get user context:', e.message);
+          // If we can't get user context, try to proceed anyway (will fail on SDK calls if not host)
+          setIsHost(true);  // Optimistically allow, SDK will reject if no permission
+          console.log('Setting isHost=true optimistically');
         }
 
       } catch (err) {
@@ -203,18 +226,58 @@ export function useZoomSdk() {
     }
   }, [isConfigured]);
 
+  // Refresh user role - can be called manually to re-check host status
+  const refreshUserRole = useCallback(async () => {
+    try {
+      console.log('=== REFRESHING USER ROLE ===');
+      const user = await zoomSdk.getUserContext();
+      setUserContext(user);
+      setRoleCheckCount(prev => prev + 1);
+
+      console.log('Refresh - Full user object:', JSON.stringify(user, null, 2));
+
+      const role = String(user.role || user.userRole || user.participantRole || '').toLowerCase();
+      const isHostOrCohost =
+        role === 'host' ||
+        role === 'cohost' ||
+        role === 'co-host' ||
+        role === 'coHost' ||
+        role.includes('host') ||
+        user.role === 1 ||
+        user.role === 2 ||
+        user.userRole === 1 ||
+        user.userRole === 2;
+
+      setIsHost(isHostOrCohost);
+      console.log('Refresh - Detected role:', role, '-> isHost:', isHostOrCohost);
+      return { role, isHost: isHostOrCohost, user };
+    } catch (e) {
+      console.error('Failed to refresh user role:', e);
+      return { error: e.message };
+    }
+  }, []);
+
+  // Force host mode - bypass role check (use when SDK returns wrong role)
+  const forceHostMode = useCallback(() => {
+    console.log('=== FORCING HOST MODE ===');
+    setIsHost(true);
+  }, []);
+
   return {
     isConfigured,
     error,
     meetingContext,
     userContext,
     isHost,
+    roleCheckCount,
     getBreakoutRooms,
     getParticipants,
     moveParticipantToRoom,
     moveToMainRoom,
     getMeetingUUID,
-    changeMyBreakoutRoom  // For moving yourself
+    changeMyBreakoutRoom,  // For moving yourself
+    refreshUserRole,  // Re-check role
+    forceHostMode  // Bypass role check
   };
 }
 

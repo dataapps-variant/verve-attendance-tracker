@@ -36,10 +36,13 @@ function MonitorPanel() {
     isConfigured,
     error: sdkError,
     meetingContext,
+    userContext,
     isHost,
     getBreakoutRooms,
     getParticipants,
-    getMeetingUUID
+    getMeetingUUID,
+    refreshUserRole,
+    forceHostMode
   } = useZoomSdk();
 
   const [isMonitoring, setIsMonitoring] = useState(false);
@@ -241,6 +244,19 @@ function MonitorPanel() {
     };
   }, []);
 
+  // AUTO-RETRY: If not host, try refreshing role a few times
+  const [retryCount, setRetryCount] = useState(0);
+  useEffect(() => {
+    if (isConfigured && !isHost && retryCount < 3) {
+      const timer = setTimeout(async () => {
+        console.log(`Auto-retry role check ${retryCount + 1}/3`);
+        await refreshUserRole();
+        setRetryCount(prev => prev + 1);
+      }, 2000);  // Retry every 2 seconds
+      return () => clearTimeout(timer);
+    }
+  }, [isConfigured, isHost, retryCount, refreshUserRole]);
+
   // AUTO-START: Begin monitoring as soon as SDK is ready and user is host/co-host
   useEffect(() => {
     if (isConfigured && isHost && !isMonitoring && !autoStarted) {
@@ -265,14 +281,43 @@ function MonitorPanel() {
     );
   }
 
-  // Not host
+  // Not host - show debug info and retry options
   if (!isHost) {
+    const detectedRole = userContext?.role || userContext?.userRole || 'unknown';
     return (
       <div style={styles.container}>
         <h2 style={styles.title}>Room Monitor</h2>
         <div style={styles.errorBox}>
           <p style={styles.errorText}>Requires host or co-host role</p>
+          <p style={{ color: '#888', fontSize: '10px', margin: '8px 0' }}>
+            Detected role: "{String(detectedRole)}"
+          </p>
+          <p style={{ color: '#666', fontSize: '9px', margin: '4px 0' }}>
+            User context: {JSON.stringify(userContext || {}).substring(0, 100)}...
+          </p>
         </div>
+        <div style={styles.actions}>
+          <button
+            style={styles.startButton}
+            onClick={async () => {
+              const result = await refreshUserRole();
+              console.log('Role refresh result:', result);
+            }}
+          >
+            Refresh Role
+          </button>
+          <button
+            style={{ ...styles.stopButton, backgroundColor: '#FF9800' }}
+            onClick={() => {
+              forceHostMode();
+            }}
+          >
+            Force Start
+          </button>
+        </div>
+        <p style={{ color: '#666', fontSize: '9px', textAlign: 'center' }}>
+          If you ARE a co-host, click "Force Start" to bypass this check
+        </p>
       </div>
     );
   }
