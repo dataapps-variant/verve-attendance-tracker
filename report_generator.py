@@ -209,12 +209,12 @@ def generate_daily_report(report_date=None):
     ),
     -- Separate lookups to avoid OR-join cartesian products
     name_to_key AS (
-      SELECT name_key, ANY_VALUE(participant_key) as participant_key
+      SELECT name_key, MIN(participant_key) as participant_key
       FROM participant_name_map
       GROUP BY name_key
     ),
     email_to_key AS (
-      SELECT email_key, ANY_VALUE(participant_key) as participant_key
+      SELECT email_key, MIN(participant_key) as participant_key
       FROM participant_name_map
       WHERE email_key IS NOT NULL
       GROUP BY email_key
@@ -249,29 +249,33 @@ def generate_daily_report(report_date=None):
     -- ==========================================================
     snapshot_clean AS (
       SELECT
+        -- Use bridged key to unify multiple UUIDs for same person
         COALESCE(
-          NULLIF(participant_uuid, ''),
-          NULLIF(LOWER(TRIM(participant_email)), ''),
-          LOWER(TRIM(participant_name))
+          ntk.participant_key,
+          NULLIF(rs.participant_uuid, ''),
+          NULLIF(LOWER(TRIM(rs.participant_email)), ''),
+          LOWER(TRIM(rs.participant_name))
         ) as participant_key,
-        participant_name,
-        COALESCE(NULLIF(participant_email, ''), '') as participant_email,
-        room_name,
-        snapshot_time
-      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
-      WHERE event_date = '{report_date}'
-        AND participant_name IS NOT NULL AND participant_name != ''
-        AND room_name IS NOT NULL AND room_name != ''
+        rs.participant_name,
+        COALESCE(NULLIF(rs.participant_email, ''), '') as participant_email,
+        rs.room_name,
+        rs.snapshot_time
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` rs
+      LEFT JOIN name_to_key ntk ON LOWER(TRIM(rs.participant_name)) = ntk.name_key
+      WHERE rs.event_date = '{report_date}'
+        AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
+        AND rs.room_name IS NOT NULL AND rs.room_name != ''
       QUALIFY ROW_NUMBER() OVER (
         PARTITION BY COALESCE(
-          NULLIF(participant_uuid, ''),
-          NULLIF(LOWER(TRIM(participant_email)), ''),
-          LOWER(TRIM(participant_name))
+          ntk.participant_key,
+          NULLIF(rs.participant_uuid, ''),
+          NULLIF(LOWER(TRIM(rs.participant_email)), ''),
+          LOWER(TRIM(rs.participant_name))
         ),
-                     snapshot_time
+                     rs.snapshot_time
         ORDER BY
-          CASE WHEN LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-          room_name
+          CASE WHEN LOWER(rs.room_name) = 'main room' OR LOWER(rs.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+          rs.room_name
       ) = 1
     ),
     -- ==========================================================

@@ -6270,12 +6270,12 @@ def attendance_summary(date=None):
         ),
         -- Separate lookups to avoid OR-join cartesian products
         name_to_key AS (
-          SELECT name_key, ANY_VALUE(participant_key) as participant_key
+          SELECT name_key, MIN(participant_key) as participant_key
           FROM participant_name_map
           GROUP BY name_key
         ),
         email_to_key AS (
-          SELECT email_key, ANY_VALUE(participant_key) as participant_key
+          SELECT email_key, MIN(participant_key) as participant_key
           FROM participant_name_map
           WHERE email_key IS NOT NULL
           GROUP BY email_key
@@ -6360,31 +6360,35 @@ def attendance_summary(date=None):
         --      Keeps renamers (same UUID, different names) in one stream.
         snapshot_clean AS (
           SELECT
+            -- Use bridged key to unify multiple UUIDs for same person
             COALESCE(
-              NULLIF(participant_uuid, ''),
-              NULLIF(LOWER(TRIM(participant_email)), ''),
-              LOWER(TRIM(participant_name))
+              ntk.participant_key,
+              NULLIF(rs.participant_uuid, ''),
+              NULLIF(LOWER(TRIM(rs.participant_email)), ''),
+              LOWER(TRIM(rs.participant_name))
             ) as participant_key,
-            participant_name,
-            COALESCE(NULLIF(participant_email, ''), '') as participant_email,
-            room_name,
-            snapshot_time
-          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
-          WHERE event_date = '{date}'
-            AND participant_name IS NOT NULL AND participant_name != ''
-            AND room_name IS NOT NULL AND room_name != ''
-            AND LOWER(participant_name) NOT LIKE '%scout%'
-            AND LOWER(room_name) != 'main room'
-            AND LOWER(room_name) NOT LIKE '0.main%'
+            rs.participant_name,
+            COALESCE(NULLIF(rs.participant_email, ''), '') as participant_email,
+            rs.room_name,
+            rs.snapshot_time
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots` rs
+          LEFT JOIN name_to_key ntk ON LOWER(TRIM(rs.participant_name)) = ntk.name_key
+          WHERE rs.event_date = '{date}'
+            AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
+            AND rs.room_name IS NOT NULL AND rs.room_name != ''
+            AND LOWER(rs.participant_name) NOT LIKE '%scout%'
+            AND LOWER(rs.room_name) != 'main room'
+            AND LOWER(rs.room_name) NOT LIKE '0.main%'
           QUALIFY ROW_NUMBER() OVER (
             PARTITION BY
               COALESCE(
-                NULLIF(participant_uuid, ''),
-                NULLIF(LOWER(TRIM(participant_email)), ''),
-                LOWER(TRIM(participant_name))
+                ntk.participant_key,
+                NULLIF(rs.participant_uuid, ''),
+                NULLIF(LOWER(TRIM(rs.participant_email)), ''),
+                LOWER(TRIM(rs.participant_name))
               ),
-              snapshot_time
-            ORDER BY room_name
+              rs.snapshot_time
+            ORDER BY rs.room_name
           ) = 1
         ),
         -- Per-participant first/last seen in breakout rooms
@@ -7448,14 +7452,27 @@ def team_attendance(team_id, date):
             WHERE event_date = @report_date
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
+        -- Separate lookups to avoid OR-join cartesian products
+        name_to_key AS (
+            SELECT name_key, MIN(participant_key) as participant_key
+            FROM participant_name_map
+            GROUP BY name_key
+        ),
+        email_to_key AS (
+            SELECT email_key, MIN(participant_key) as participant_key
+            FROM participant_name_map
+            WHERE email_key IS NOT NULL
+            GROUP BY email_key
+        ),
         -- Resolve each team member to the UUID-based key used downstream.
         team_member_keys AS (
             SELECT DISTINCT
-                COALESCE(pnm.participant_key, LOWER(TRIM(tm.participant_name))) as participant_key
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(tm.participant_name))) as participant_key
             FROM team_members tm
-            LEFT JOIN participant_name_map pnm
-                ON LOWER(TRIM(tm.participant_name)) = pnm.name_key
-                OR NULLIF(LOWER(TRIM(tm.participant_email)), '') = pnm.email_key
+            LEFT JOIN email_to_key etk
+                ON NULLIF(LOWER(TRIM(tm.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key ntk
+                ON LOWER(TRIM(tm.participant_name)) = ntk.name_key
         ),
         clean_snapshots AS (
             SELECT
@@ -7617,35 +7634,37 @@ def team_attendance(team_id, date):
         -- in that case Main Room time should be 0, not the entire meeting.
         breakout_webhook_presence AS (
             SELECT
-                COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
                 COUNT(*) as breakout_joined_count
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            LEFT JOIN participant_name_map pnm
-                ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
-                OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
+            LEFT JOIN email_to_key etk
+                ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key ntk
+                ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
             WHERE pe.event_date = @report_date
               AND pe.event_type = 'breakout_room_joined'
               AND pe.participant_name IS NOT NULL
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+            GROUP BY COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
         ),
         -- Main meeting time from webhooks (participant_joined / participant_left)
-        -- Webhooks lack UUID, so we bridge via participant_name_map.
+        -- Webhooks lack UUID, so we bridge via separate name/email lookups.
         webhook_times AS (
             SELECT
-                COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
                 MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
                     THEN TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END) as meeting_joined,
                 MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
                     THEN TIMESTAMP_ADD(CAST(pe.event_timestamp AS TIMESTAMP), INTERVAL 330 MINUTE) END) as meeting_left
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            LEFT JOIN participant_name_map pnm
-                ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
-                OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
+            LEFT JOIN email_to_key etk
+                ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key ntk
+                ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
             WHERE pe.event_date = @report_date
               AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+            GROUP BY COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
         )
 
         SELECT
@@ -7988,15 +8007,29 @@ def team_attendance_range(team_id):
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
+        -- Separate lookups to avoid OR-join cartesian products
+        name_to_key AS (
+            SELECT event_date, name_key, MIN(participant_key) as participant_key
+            FROM participant_name_map
+            GROUP BY event_date, name_key
+        ),
+        email_to_key AS (
+            SELECT event_date, email_key, MIN(participant_key) as participant_key
+            FROM participant_name_map
+            WHERE email_key IS NOT NULL
+            GROUP BY event_date, email_key
+        ),
         team_member_keys AS (
             SELECT DISTINCT
-                pnm.event_date,
-                COALESCE(pnm.participant_key, LOWER(TRIM(tm.participant_name))) as participant_key
+                COALESCE(etk.event_date, ntk.event_date) as event_date,
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(tm.participant_name))) as participant_key
             FROM team_members tm
-            LEFT JOIN participant_name_map pnm
-                ON LOWER(TRIM(tm.participant_name)) = pnm.name_key
-                OR NULLIF(LOWER(TRIM(tm.participant_email)), '') = pnm.email_key
-            WHERE pnm.event_date IS NOT NULL
+            LEFT JOIN email_to_key etk
+                ON NULLIF(LOWER(TRIM(tm.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key ntk
+                ON LOWER(TRIM(tm.participant_name)) = ntk.name_key
+                AND (etk.event_date IS NULL OR ntk.event_date = etk.event_date)
+            WHERE COALESCE(etk.event_date, ntk.event_date) IS NOT NULL
         ),
         -- Dedupe: one row per (participant, snapshot_time) before windowing,
         -- so SDK transition artifacts (two rooms at once) don't inflate
@@ -8149,27 +8182,27 @@ def team_attendance_range(team_id):
         daily_breakout_webhooks AS (
             SELECT
                 pe.event_date,
-                COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
                 COUNT(*) as breakout_joined_count
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            LEFT JOIN participant_name_map pnm
-                ON pe.event_date = pnm.event_date
-               AND (
-                   LOWER(TRIM(pe.participant_name)) = pnm.name_key
-                   OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
-               )
+            LEFT JOIN email_to_key etk
+                ON pe.event_date = etk.event_date
+               AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key ntk
+                ON pe.event_date = ntk.event_date
+               AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
             WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
               AND pe.event_type = 'breakout_room_joined'
               AND pe.participant_name IS NOT NULL
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY pe.event_date, COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+            GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
         ),
-        -- Main meeting time from webhooks (bridged to UUID via name_map).
+        -- Main meeting time from webhooks (bridged to UUID via separate lookups).
         -- Raw timestamps are exposed so main_room_mins can be clamped below.
         daily_webhook AS (
             SELECT
                 pe.event_date,
-                COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
                 MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
                     THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_joined_ts,
                 MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
@@ -8182,20 +8215,17 @@ def team_attendance_range(team_id):
                     MINUTE) as meeting_duration_mins
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
             INNER JOIN team_members tm
-                ON (
-                    LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
-                    OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), '')
-                )
-            LEFT JOIN participant_name_map pnm
-                ON pe.event_date = pnm.event_date
-               AND (
-                   LOWER(TRIM(pe.participant_name)) = pnm.name_key
-                   OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
-               )
+                ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+            LEFT JOIN email_to_key etk
+                ON pe.event_date = etk.event_date
+               AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key ntk
+                ON pe.event_date = ntk.event_date
+               AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
             WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
               AND pe.participant_name IS NOT NULL
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY pe.event_date, COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+            GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
         )
         SELECT
             ds.event_date,
@@ -8536,15 +8566,29 @@ def team_monthly_report(team_id):
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
         ),
+        -- Separate lookups to avoid OR-join cartesian products
+        name_to_key AS (
+            SELECT event_date, name_key, MIN(participant_key) as participant_key
+            FROM participant_name_map
+            GROUP BY event_date, name_key
+        ),
+        email_to_key AS (
+            SELECT event_date, email_key, MIN(participant_key) as participant_key
+            FROM participant_name_map
+            WHERE email_key IS NOT NULL
+            GROUP BY event_date, email_key
+        ),
         team_member_keys AS (
             SELECT DISTINCT
-                pnm.event_date,
-                COALESCE(pnm.participant_key, LOWER(TRIM(tm.participant_name))) as participant_key
+                COALESCE(etk.event_date, ntk.event_date) as event_date,
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(tm.participant_name))) as participant_key
             FROM team_members tm
-            LEFT JOIN participant_name_map pnm
-                ON LOWER(TRIM(tm.participant_name)) = pnm.name_key
-                OR NULLIF(LOWER(TRIM(tm.participant_email)), '') = pnm.email_key
-            WHERE pnm.event_date IS NOT NULL
+            LEFT JOIN email_to_key etk
+                ON NULLIF(LOWER(TRIM(tm.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key ntk
+                ON LOWER(TRIM(tm.participant_name)) = ntk.name_key
+                AND (etk.event_date IS NULL OR ntk.event_date = etk.event_date)
+            WHERE COALESCE(etk.event_date, ntk.event_date) IS NOT NULL
         ),
         -- Dedupe: one row per (participant, snapshot_time) before windowing
         deduped_snaps AS (
@@ -8694,27 +8738,27 @@ def team_monthly_report(team_id):
         daily_breakout_webhooks AS (
             SELECT
                 pe.event_date,
-                COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
                 COUNT(*) as breakout_joined_count
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
-            LEFT JOIN participant_name_map pnm
-                ON pe.event_date = pnm.event_date
-               AND (
-                   LOWER(TRIM(pe.participant_name)) = pnm.name_key
-                   OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
-               )
+            LEFT JOIN email_to_key etk
+                ON pe.event_date = etk.event_date
+               AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key ntk
+                ON pe.event_date = ntk.event_date
+               AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
             WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
               AND pe.event_type = 'breakout_room_joined'
               AND pe.participant_name IS NOT NULL
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY pe.event_date, COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+            GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
         ),
-        -- Main meeting time from webhooks (bridged to UUID per day).
+        -- Main meeting time from webhooks (bridged to UUID via separate lookups).
         -- Raw timestamps exposed so main_room_mins can clamp to the SDK window.
         daily_webhook AS (
             SELECT
                 pe.event_date,
-                COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+                COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
                 MIN(CASE WHEN pe.event_type IN ('participant_joined', 'meeting.participant_joined')
                     THEN CAST(pe.event_timestamp AS TIMESTAMP) END) as meeting_joined_ts,
                 MAX(CASE WHEN pe.event_type IN ('participant_left', 'meeting.participant_left')
@@ -8727,20 +8771,17 @@ def team_monthly_report(team_id):
                     MINUTE) as meeting_duration_mins
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
             INNER JOIN team_members tm
-                ON (
-                    LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
-                    OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), '')
-                )
-            LEFT JOIN participant_name_map pnm
-                ON pe.event_date = pnm.event_date
-               AND (
-                   LOWER(TRIM(pe.participant_name)) = pnm.name_key
-                   OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
-               )
+                ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+            LEFT JOIN email_to_key etk
+                ON pe.event_date = etk.event_date
+               AND NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+            LEFT JOIN name_to_key ntk
+                ON pe.event_date = ntk.event_date
+               AND LOWER(TRIM(pe.participant_name)) = ntk.name_key
             WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
               AND pe.participant_name IS NOT NULL
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-            GROUP BY pe.event_date, COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+            GROUP BY pe.event_date, COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
         )
 
         SELECT
