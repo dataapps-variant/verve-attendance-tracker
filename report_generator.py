@@ -177,10 +177,10 @@ def generate_daily_report(report_date=None):
     client = get_bq_client()
 
     # =============================================
-    # MAIN QUERY - ONE ROW PER ROOM VISIT
+    # MAIN QUERY - ONE ROW PER PARTICIPANT
     #
-    # Each row = one participant's visit to one room
-    # Shows: Name, Email, Room, Room_Joined, Room_Left, Duration
+    # Each row = one participant's daily attendance summary.
+    # Shows: Name, Email, Main Join/Left, Total Duration, Room History
     #
     # How it works:
     #   SDK polls every 30s → detect room transitions → output each visit
@@ -201,7 +201,8 @@ def generate_daily_report(report_date=None):
           NULLIF(LOWER(TRIM(participant_email)), ''),
           LOWER(TRIM(participant_name))
         ) as participant_key,
-        LOWER(TRIM(participant_name)) as name_key
+        LOWER(TRIM(participant_name)) as name_key,
+        NULLIF(LOWER(TRIM(participant_email)), '') as email_key
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
       WHERE event_date = '{report_date}'
         AND participant_name IS NOT NULL AND participant_name != ''
@@ -222,6 +223,7 @@ def generate_daily_report(report_date=None):
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
       LEFT JOIN participant_name_map pnm
         ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
+        OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
       WHERE pe.event_date = '{report_date}'
         AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
       GROUP BY COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
@@ -348,30 +350,59 @@ def generate_daily_report(report_date=None):
         room_name,
         MIN(join_time) as join_time,
         MAX(leave_time) as leave_time,
-        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MIN(join_time), INTERVAL 330 MINUTE)) as room_joined_ist,
-        FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(MAX(leave_time), INTERVAL 330 MINUTE)) as room_left_ist,
+        FORMAT_TIMESTAMP('%H:%M', MIN(join_time), 'Asia/Kolkata') as room_joined_ist,
+        FORMAT_TIMESTAMP('%H:%M', MAX(leave_time), 'Asia/Kolkata') as room_left_ist,
         -- Sum actual durations from room_visits_raw (already interval-based)
         SUM(duration_mins) as duration_mins
       FROM remerge_groups
       GROUP BY participant_key, room_name, merge_group
+    ),
+    participant_report AS (
+      SELECT
+        rv.participant_key,
+        ARRAY_AGG(rv.participant_name ORDER BY rv.join_time DESC LIMIT 1)[OFFSET(0)] as Name,
+        COALESCE(
+          NULLIF(MAX(NULLIF(rv.participant_email, '')), ''),
+          NULLIF(MAX(NULLIF(w.participant_email, '')), ''),
+          ''
+        ) as Email,
+        MIN(rv.join_time) as first_room_join_time,
+        MAX(rv.leave_time) as last_room_leave_time,
+        MIN(w.main_join_time) as main_join_time,
+        MAX(w.main_leave_time) as main_leave_time,
+        SUM(CASE
+          WHEN LOWER(rv.room_name) LIKE '%break time%' THEN 0
+          ELSE rv.duration_mins
+        END) as Total_Duration_Minutes,
+        STRING_AGG(
+          FORMAT(
+            '%s [Joined: %s | Left: %s | Duration: %dmin]',
+            rv.room_name,
+            rv.room_joined_ist,
+            rv.room_left_ist,
+            CAST(rv.duration_mins AS INT64)
+          ),
+          ' -> '
+          ORDER BY rv.join_time
+        ) as Room_History
+      FROM room_visits_final rv
+      LEFT JOIN webhook_times w ON rv.participant_key = w.participant_key
+      WHERE rv.participant_name NOT LIKE '%Scout%'
+        AND rv.duration_mins > 0
+      GROUP BY rv.participant_key
     )
     -- ==========================================================
-    -- OUTPUT: One clean row per room visit with main meeting times
+    -- OUTPUT: One clean row per participant with summed time
     -- ==========================================================
     SELECT
-      rv.participant_name as Name,
-      COALESCE(NULLIF(rv.participant_email, ''), w.participant_email, '') as Email,
-      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(w.main_join_time, INTERVAL 330 MINUTE)) as Main_Joined_IST,
-      FORMAT_TIMESTAMP('%H:%M', TIMESTAMP_ADD(w.main_leave_time, INTERVAL 330 MINUTE)) as Main_Left_IST,
-      rv.room_name as Room,
-      rv.room_joined_ist as Room_Joined_IST,
-      rv.room_left_ist as Room_Left_IST,
-      rv.duration_mins as Duration_Minutes
-    FROM room_visits_final rv
-    LEFT JOIN webhook_times w ON rv.participant_key = w.participant_key
-    WHERE rv.participant_name NOT LIKE '%Scout%'
-      AND rv.duration_mins > 0
-    ORDER BY rv.participant_name, rv.join_time
+      Name,
+      Email,
+      FORMAT_TIMESTAMP('%H:%M', COALESCE(main_join_time, first_room_join_time), 'Asia/Kolkata') as Main_Joined_IST,
+      FORMAT_TIMESTAMP('%H:%M', COALESCE(main_leave_time, last_room_leave_time), 'Asia/Kolkata') as Main_Left_IST,
+      Total_Duration_Minutes,
+      Room_History
+    FROM participant_report
+    ORDER BY Name
     """
 
     try:
@@ -414,7 +445,7 @@ def format_minutes_to_hhmm(minutes):
 
 
 def generate_csv(report):
-    """Generate CSV content from report data - ONE ROW PER ROOM VISIT"""
+    """Generate CSV content from report data - ONE ROW PER PARTICIPANT"""
     output = io.StringIO()
     writer = csv.writer(output)
 
@@ -424,25 +455,23 @@ def generate_csv(report):
         'Email',
         'Main_Joined_IST',
         'Main_Left_IST',
-        'Room',
-        'Room_Joined_IST',
-        'Room_Left_IST',
-        'Duration_Minutes'
+        'Total_Duration_Minutes',
+        'Total_Duration',
+        'Room_History'
     ])
 
-    # Data rows - one row per room visit
+    # Data rows - one row per participant
     for p in report['participants']:
-        duration_mins = p.get('Duration_Minutes', 0) or 0
+        duration_mins = p.get('Total_Duration_Minutes', 0) or 0
 
         writer.writerow([
             p.get('Name', '') or '',
             p.get('Email', '') or '',
             p.get('Main_Joined_IST', '') or '',
             p.get('Main_Left_IST', '') or '',
-            p.get('Room', '') or '',
-            p.get('Room_Joined_IST', '') or '',
-            p.get('Room_Left_IST', '') or '',
-            duration_mins
+            duration_mins,
+            format_minutes_to_hhmm(duration_mins),
+            p.get('Room_History', '') or ''
         ])
 
     return output.getvalue()
@@ -489,21 +518,21 @@ def send_report_email(report, report_date):
                 <p><strong>Total Participants:</strong> {report['total_participants']}</p>
             </div>
 
-            <h2>Attendance (First 30 rows shown, full data in CSV)</h2>
+            <h2>Attendance (First 30 participants shown, full data in CSV)</h2>
             <table>
                 <tr>
                     <th>Name</th>
                     <th>Email</th>
                     <th>Joined IST</th>
                     <th>Left IST</th>
-                    <th>Duration</th>
-                    <th>Room</th>
+                    <th>Total Duration</th>
+                    <th>Room History</th>
                 </tr>
         """
 
         for p in report['participants'][:30]:  # Limit to 30 in email
-            room = p.get('Room', '-') or '-'
-            duration = p.get('Duration_Minutes', 0) or 0
+            room_history = p.get('Room_History', '-') or '-'
+            duration = p.get('Total_Duration_Minutes', 0) or 0
 
             html_content += f"""
                 <tr>
@@ -512,7 +541,7 @@ def send_report_email(report, report_date):
                     <td>{p.get('Main_Joined_IST', '')}</td>
                     <td>{p.get('Main_Left_IST', '')}</td>
                     <td>{format_minutes_to_hhmm(duration)}</td>
-                    <td style="font-size:10px;">{room}</td>
+                    <td style="font-size:10px;">{room_history}</td>
                 </tr>
             """
 
@@ -521,8 +550,8 @@ def send_report_email(report, report_date):
 
             <div class="footer">
                 <p><strong>Full attendance data is in the attached CSV file.</strong></p>
-                <p>CSV Format: One row per room visit (participant may have multiple rows)</p>
-                <p>Columns: Name, Email, Main_Joined_IST, Main_Left_IST, Room, Room_Joined_IST, Room_Left_IST, Duration_Minutes</p>
+                <p>CSV Format: One row per participant with summed room time</p>
+                <p>Columns: Name, Email, Main_Joined_IST, Main_Left_IST, Total_Duration_Minutes, Total_Duration, Room_History</p>
                 <p>Generated by Zoom Breakout Room Tracker</p>
             </div>
         </body>

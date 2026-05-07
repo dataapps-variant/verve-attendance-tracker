@@ -439,9 +439,9 @@ REPORT_EMAIL_TO = os.environ.get('REPORT_EMAIL_TO', '')
 # ==============================================================================
 # Resend API for sending email alerts
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
-# Comma-separated list of recipient emails
-ALERT_EMAILS = os.environ.get('ALERT_EMAILS', '').split(',') if os.environ.get('ALERT_EMAILS') else []
-ALERT_EMAILS = [e.strip() for e in ALERT_EMAILS if e.strip()]
+# Semicolon-separated list of recipient emails (semicolon avoids gcloud parsing issues)
+_alert_emails_raw = os.environ.get('ALERT_EMAILS', '')
+ALERT_EMAILS = [e.strip() for e in _alert_emails_raw.replace(',', ';').split(';') if e.strip()]
 # Sender email (must be verified domain or use onboarding@resend.dev for testing)
 ALERT_FROM_EMAIL = os.environ.get('ALERT_FROM_EMAIL', 'onboarding@resend.dev')
 
@@ -458,7 +458,9 @@ _email_alert_state = {
     'bot_left': {'last_time': 0, 'count_today': 0},
     'meeting_ended': {'last_time': 0, 'count_today': 0},
     'error': {'last_time': 0, 'count_today': 0},
-    'last_reset_date': None
+    'recovered': {'last_time': 0, 'count_today': 0},
+    'last_reset_date': None,
+    'was_stale': False  # Track if we were in stale state
 }
 
 # Clients
@@ -3276,13 +3278,50 @@ def send_alert_error(error_type, error_message, context=""):
 
 
 # ─────────────────────────────────────────────────────────
+# ALERT: Monitoring Resumed (App Reopened)
+# ─────────────────────────────────────────────────────────
+def send_alert_recovered():
+    """Send confirmation email when monitoring resumes after being stale."""
+    can_send, wait_time = _can_send_alert('recovered', rate_limit_seconds=60)
+    if not can_send:
+        print(f"[EmailAlert] Recovery alert rate limited, wait {wait_time}s")
+        return {'sent': False, 'reason': f'Rate limited, wait {wait_time}s'}
+
+    ist_time = get_ist_now().strftime('%I:%M %p')
+    today = get_ist_date()
+    subject = f"✅ Monitoring Resumed - App Reopened"
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 500px; padding: 20px; border: 2px solid #27ae60; border-radius: 10px;">
+        <h2 style="color: #27ae60; margin-top: 0;">✅ Monitoring Resumed</h2>
+        <p style="font-size: 16px; color: #333;"><strong>Zoom App panel is now open and monitoring!</strong></p>
+        <p style="background: #d4edda; padding: 15px; border-radius: 5px; border-left: 4px solid #27ae60;">
+            <strong>✓ All Good:</strong><br>
+            Attendance data is now being captured.
+        </p>
+        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+        <table style="font-size: 14px; color: #666;">
+            <tr><td><strong>Time:</strong></td><td>{ist_time} IST</td></tr>
+            <tr><td><strong>Status:</strong></td><td style="color: #27ae60;">HEALTHY</td></tr>
+            <tr><td><strong>Date:</strong></td><td>{today}</td></tr>
+        </table>
+    </div>
+    """
+    result = send_email_alert(subject, html_body)
+    if result.get('success'):
+        _record_alert_sent('recovered')
+    return result
+
+
+# ─────────────────────────────────────────────────────────
 # Check and Send Stale Alert (called by Cloud Scheduler)
 # ─────────────────────────────────────────────────────────
 def check_and_send_stale_alert():
     """
     Check if monitoring is stale and send email alert if needed.
     Called by Cloud Scheduler every minute.
+    Also sends recovery email when monitoring resumes after being stale.
     """
+    global _email_alert_state
     today = get_ist_date()
 
     try:
@@ -3300,18 +3339,35 @@ def check_and_send_stale_alert():
         snapshot_count = row.get('snapshot_count', 0) or 0
         seconds_since = row.get('seconds_since_last', None)
 
-        # Determine if alert needed
-        needs_alert = False
+        # Determine status
+        is_stale = False
         status = 'HEALTHY'
 
         if snapshot_count == 0:
-            needs_alert = True
+            is_stale = True
             status = 'NO_DATA'
         elif seconds_since is not None and seconds_since > ALERT_STALE_THRESHOLD_SECONDS:
-            needs_alert = True
+            is_stale = True
             status = 'STALE'
 
-        if not needs_alert:
+        was_stale = _email_alert_state.get('was_stale', False)
+
+        # If now healthy but was stale, send recovery email
+        if not is_stale and was_stale:
+            _email_alert_state['was_stale'] = False
+            print(f"[EmailAlert] Monitoring recovered! Sending confirmation...")
+            recovery_result = send_alert_recovered()
+            return {
+                'alert_sent': recovery_result.get('success', False),
+                'alert_type': 'recovered',
+                'reason': 'Monitoring resumed after being stale',
+                'status': status,
+                'seconds_since_last': seconds_since,
+                'send_result': recovery_result
+            }
+
+        # If healthy, nothing to do
+        if not is_stale:
             return {
                 'alert_sent': False,
                 'reason': 'Monitoring is healthy',
@@ -3319,11 +3375,13 @@ def check_and_send_stale_alert():
                 'seconds_since_last': seconds_since
             }
 
-        # Send stale alert
+        # Mark as stale and send stale alert
+        _email_alert_state['was_stale'] = True
         send_result = send_alert_stale_data(seconds_since, status)
 
         return {
             'alert_sent': send_result.get('success', False),
+            'alert_type': 'stale',
             'status': status,
             'seconds_since_last': seconds_since,
             'send_result': send_result
@@ -6200,6 +6258,7 @@ def attendance_summary(date=None):
         participant_name_map AS (
           SELECT DISTINCT
             LOWER(TRIM(participant_name)) as name_key,
+            NULLIF(LOWER(TRIM(participant_email)), '') as email_key,
             COALESCE(
               NULLIF(participant_uuid, ''),
               NULLIF(LOWER(TRIM(participant_email)), ''),
@@ -6238,6 +6297,7 @@ def attendance_summary(date=None):
           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
           LEFT JOIN participant_name_map pnm
             ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
+            OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
           WHERE pe.event_date = '{date}'
             AND pe.event_type IN ('breakout_room_joined', 'breakout_room_left')
             AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
@@ -6258,6 +6318,7 @@ def attendance_summary(date=None):
           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
           LEFT JOIN participant_name_map pnm
             ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
+            OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
           WHERE pe.event_date = '{date}'
             AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
             AND LOWER(pe.participant_name) NOT LIKE '%scout%'
@@ -6530,7 +6591,10 @@ def attendance_summary(date=None):
         room_visits_agg AS (
           SELECT
             participant_key,
-            SUM(duration_mins) as total_duration_mins,
+            SUM(CASE
+              WHEN LOWER(room_name) LIKE '%break time%' THEN 0
+              ELSE duration_mins
+            END) as total_duration_mins,
             ARRAY_AGG(
               STRUCT(
                 room_name,
@@ -7364,7 +7428,8 @@ def team_attendance(team_id, date):
         participant_name_map AS (
             SELECT DISTINCT
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
-                LOWER(TRIM(participant_name)) as name_key
+                LOWER(TRIM(participant_name)) as name_key,
+                NULLIF(LOWER(TRIM(participant_email)), '') as email_key
             FROM `{dataset_ref}.room_snapshots`
             WHERE event_date = @report_date
               AND participant_name IS NOT NULL AND participant_name != ''
@@ -7376,6 +7441,7 @@ def team_attendance(team_id, date):
             FROM team_members tm
             LEFT JOIN participant_name_map pnm
                 ON LOWER(TRIM(tm.participant_name)) = pnm.name_key
+                OR NULLIF(LOWER(TRIM(tm.participant_email)), '') = pnm.email_key
         ),
         clean_snapshots AS (
             SELECT
@@ -7421,6 +7487,7 @@ def team_attendance(team_id, date):
                 cs.participant_key,
                 cs.participant_name,
                 cs.participant_email,
+                cs.room_name,
                 cs.snapshot_time,
                 cs.snapshot_ist,
                 LAG(cs.snapshot_time) OVER (PARTITION BY cs.participant_key ORDER BY cs.snapshot_time) as prev_snapshot_time
@@ -7444,6 +7511,24 @@ def team_attendance(team_id, date):
                         ELSE 0  -- After long gap, start marker for new presence period
                     END
                 ) / 60.0) as total_active_mins,
+                CEILING(SUM(
+                    CASE
+                        WHEN prev_snapshot_time IS NULL THEN 0
+                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) <= 300
+                             AND (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
+                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND)
+                        ELSE 0
+                    END
+                ) / 60.0) as main_snapshot_mins,
+                CEILING(SUM(
+                    CASE
+                        WHEN prev_snapshot_time IS NULL THEN 0
+                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) <= 300
+                             AND NOT (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
+                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND)
+                        ELSE 0
+                    END
+                ) / 60.0) as breakout_active_mins,
                 COUNT(DISTINCT snapshot_time) as snapshot_count
             FROM snapshots_with_gap
             GROUP BY participant_key
@@ -7523,6 +7608,7 @@ def team_attendance(team_id, date):
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
             LEFT JOIN participant_name_map pnm
                 ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
+                OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
             WHERE pe.event_date = @report_date
               AND pe.event_type = 'breakout_room_joined'
               AND pe.participant_name IS NOT NULL
@@ -7541,6 +7627,7 @@ def team_attendance(team_id, date):
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
             LEFT JOIN participant_name_map pnm
                 ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
+                OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
             WHERE pe.event_date = @report_date
               AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
@@ -7562,6 +7649,8 @@ def team_attendance(team_id, date):
             CASE WHEN wt.meeting_joined IS NOT NULL AND wt.meeting_left IS NOT NULL
                  THEN TIMESTAMP_DIFF(wt.meeting_left, wt.meeting_joined, MINUTE)
                  ELSE 0 END as meeting_duration_mins,
+            ps.main_snapshot_mins,
+            ps.breakout_active_mins,
             -- main_room_mins: meeting span minus tracked active minus break room.
             -- Two safeguards:
             --   (a) meeting_left clamped to last SDK snapshot — outage protection.
@@ -7635,7 +7724,10 @@ def team_attendance(team_id, date):
                 ROW_NUMBER() OVER (PARTITION BY pe.participant_name ORDER BY pe.event_timestamp) as rn
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
             INNER JOIN `{dataset_ref}.{BQ_TEAM_MEMBERS_TABLE}` tm
-                ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+                ON (
+                    LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+                    OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), '')
+                )
                 AND tm.team_id = @team_id
             WHERE pe.event_date = @report_date
               AND pe.participant_name IS NOT NULL
@@ -7705,11 +7797,14 @@ def team_attendance(team_id, date):
             break_mins = round(r.break_seconds / 60)
             iso_mins = round(r.isolation_seconds / 60)
             # Total time = breakout room time + main room time
-            main_room = r.main_room_mins if r.main_room_mins else 0
+            main_fill = r.main_room_mins if r.main_room_mins else 0
+            main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
+            breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else r.total_active_mins
+            main_room = main_fill + main_snapshot
             meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
-            # Combine breakout room time (from snapshots) + main room time (from webhooks gap-fill)
+            # Combine tracked active time with webhook gap-fill for untracked main room.
             # This gives the full working time, not just breakout room time
-            total_mins = r.total_active_mins + main_room if r.total_active_mins > 0 else meeting_dur
+            total_mins = r.total_active_mins + main_fill if r.total_active_mins > 0 else meeting_dur
 
             # Hour-based status: >=5hr=Present, 4-5hr=Half Day, <4hr=Absent
             if total_mins >= 300:
@@ -7725,7 +7820,7 @@ def team_attendance(team_id, date):
                 'first_seen_ist': r.meeting_joined_ist or r.first_seen_ist,
                 'last_seen_ist': r.meeting_left_ist or r.last_seen_ist,
                 'total_duration_mins': total_mins,
-                'breakout_mins': r.total_active_mins,
+                'breakout_mins': breakout_mins,
                 'main_room_mins': main_room,
                 'break_minutes': break_mins,
                 'isolation_minutes': iso_mins,
@@ -7873,7 +7968,8 @@ def team_attendance_range(team_id):
             SELECT DISTINCT
                 event_date,
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
-                LOWER(TRIM(participant_name)) as name_key
+                LOWER(TRIM(participant_name)) as name_key,
+                NULLIF(LOWER(TRIM(participant_email)), '') as email_key
             FROM `{dataset_ref}.room_snapshots`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
@@ -7885,6 +7981,7 @@ def team_attendance_range(team_id):
             FROM team_members tm
             LEFT JOIN participant_name_map pnm
                 ON LOWER(TRIM(tm.participant_name)) = pnm.name_key
+                OR NULLIF(LOWER(TRIM(tm.participant_email)), '') = pnm.email_key
             WHERE pnm.event_date IS NOT NULL
         ),
         -- Dedupe: one row per (participant, snapshot_time) before windowing,
@@ -7936,6 +8033,7 @@ def team_attendance_range(team_id):
             SELECT
                 event_date,
                 participant_name,
+                room_name,
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
                 snapshot_time,
                 TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
@@ -7962,6 +8060,24 @@ def team_attendance_range(team_id):
                         ELSE 0  -- After long gap, start marker for new presence period
                     END
                 )) as active_mins,
+                CEILING(SUM(
+                    CASE
+                        WHEN prev_snapshot IS NULL THEN 0
+                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
+                             AND (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
+                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
+                        ELSE 0
+                    END
+                )) as main_snapshot_mins,
+                CEILING(SUM(
+                    CASE
+                        WHEN prev_snapshot IS NULL THEN 0
+                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
+                             AND NOT (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
+                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
+                        ELSE 0
+                    END
+                )) as breakout_active_mins,
                 COUNT(DISTINCT snapshot_time) as snapshot_count
             FROM ordered_snaps
             GROUP BY event_date, participant_key
@@ -8024,7 +8140,10 @@ def team_attendance_range(team_id):
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
             LEFT JOIN participant_name_map pnm
                 ON pe.event_date = pnm.event_date
-               AND LOWER(TRIM(pe.participant_name)) = pnm.name_key
+               AND (
+                   LOWER(TRIM(pe.participant_name)) = pnm.name_key
+                   OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
+               )
             WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
               AND pe.event_type = 'breakout_room_joined'
               AND pe.participant_name IS NOT NULL
@@ -8049,10 +8168,16 @@ def team_attendance_range(team_id):
                     MINUTE) as meeting_duration_mins
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
             INNER JOIN team_members tm
-                ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+                ON (
+                    LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+                    OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), '')
+                )
             LEFT JOIN participant_name_map pnm
                 ON pe.event_date = pnm.event_date
-               AND LOWER(TRIM(pe.participant_name)) = pnm.name_key
+               AND (
+                   LOWER(TRIM(pe.participant_name)) = pnm.name_key
+                   OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
+               )
             WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
               AND pe.participant_name IS NOT NULL
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
@@ -8065,6 +8190,8 @@ def team_attendance_range(team_id):
             FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
             ds.active_mins,
+            ds.main_snapshot_mins,
+            ds.breakout_active_mins,
             COALESCE(ROUND(db.break_seconds / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(db.break_count, 0) as break_count,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
@@ -8127,8 +8254,11 @@ def team_attendance_range(team_id):
         daily_data = []
         for r in rows:
             meeting_dur = r.meeting_duration_mins if hasattr(r, 'meeting_duration_mins') and r.meeting_duration_mins else 0
-            main_room = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
-            total_mins = r.active_mins + main_room if r.active_mins > 0 else meeting_dur
+            main_fill = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
+            main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
+            breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else r.active_mins
+            main_room = main_fill + main_snapshot
+            total_mins = r.active_mins + main_fill if r.active_mins > 0 else meeting_dur
             if total_mins >= 300:
                 status = 'Present'
             elif total_mins >= 240:
@@ -8142,7 +8272,7 @@ def team_attendance_range(team_id):
                 'first_seen_ist': r.first_seen_ist,
                 'last_seen_ist': r.last_seen_ist,
                 'active_minutes': total_mins,
-                'breakout_minutes': r.active_mins,
+                'breakout_minutes': breakout_mins,
                 'main_room_minutes': int(main_room),
                 'break_minutes': int(r.break_mins),
                 'isolation_minutes': int(r.isolation_mins),
@@ -8386,7 +8516,8 @@ def team_monthly_report(team_id):
             SELECT DISTINCT
                 event_date,
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
-                LOWER(TRIM(participant_name)) as name_key
+                LOWER(TRIM(participant_name)) as name_key,
+                NULLIF(LOWER(TRIM(participant_email)), '') as email_key
             FROM `{dataset_ref}.room_snapshots`
             WHERE event_date >= @start_date AND event_date <= @end_date
               AND participant_name IS NOT NULL AND participant_name != ''
@@ -8398,6 +8529,7 @@ def team_monthly_report(team_id):
             FROM team_members tm
             LEFT JOIN participant_name_map pnm
                 ON LOWER(TRIM(tm.participant_name)) = pnm.name_key
+                OR NULLIF(LOWER(TRIM(tm.participant_email)), '') = pnm.email_key
             WHERE pnm.event_date IS NOT NULL
         ),
         -- Dedupe: one row per (participant, snapshot_time) before windowing
@@ -8447,6 +8579,7 @@ def team_monthly_report(team_id):
                 event_date,
                 COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
                 participant_name,
+                room_name,
                 snapshot_time,
                 TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
                 LAG(snapshot_time) OVER (
@@ -8472,6 +8605,24 @@ def team_monthly_report(team_id):
                         ELSE 0
                     END
                 )) as active_mins,
+                CEILING(SUM(
+                    CASE
+                        WHEN prev_snapshot IS NULL THEN 0
+                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
+                             AND (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
+                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
+                        ELSE 0
+                    END
+                )) as main_snapshot_mins,
+                CEILING(SUM(
+                    CASE
+                        WHEN prev_snapshot IS NULL THEN 0
+                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
+                             AND NOT (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
+                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
+                        ELSE 0
+                    END
+                )) as breakout_active_mins,
                 COUNT(DISTINCT snapshot_time) as snapshot_count
             FROM ordered_snaps
             GROUP BY event_date, participant_key
@@ -8534,7 +8685,10 @@ def team_monthly_report(team_id):
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
             LEFT JOIN participant_name_map pnm
                 ON pe.event_date = pnm.event_date
-               AND LOWER(TRIM(pe.participant_name)) = pnm.name_key
+               AND (
+                   LOWER(TRIM(pe.participant_name)) = pnm.name_key
+                   OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
+               )
             WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
               AND pe.event_type = 'breakout_room_joined'
               AND pe.participant_name IS NOT NULL
@@ -8559,10 +8713,16 @@ def team_monthly_report(team_id):
                     MINUTE) as meeting_duration_mins
             FROM `{dataset_ref}.{BQ_EVENTS_TABLE}` pe
             INNER JOIN team_members tm
-                ON LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+                ON (
+                    LOWER(TRIM(pe.participant_name)) = LOWER(TRIM(tm.participant_name))
+                    OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = NULLIF(LOWER(TRIM(tm.participant_email)), '')
+                )
             LEFT JOIN participant_name_map pnm
                 ON pe.event_date = pnm.event_date
-               AND LOWER(TRIM(pe.participant_name)) = pnm.name_key
+               AND (
+                   LOWER(TRIM(pe.participant_name)) = pnm.name_key
+                   OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
+               )
             WHERE pe.event_date >= @start_date AND pe.event_date <= @end_date
               AND pe.participant_name IS NOT NULL
               AND LOWER(pe.participant_name) NOT LIKE '%scout%'
@@ -8576,6 +8736,8 @@ def team_monthly_report(team_id):
             FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
             FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
             ds.active_mins,
+            ds.main_snapshot_mins,
+            ds.breakout_active_mins,
             COALESCE(ROUND(db.break_seconds / 60), 0) + COALESCE(ROUND(brt.break_room_mins), 0) as break_mins,
             COALESCE(ROUND(di.isolation_seconds / 60), 0) as isolation_mins,
             COALESCE(dw.meeting_duration_mins, 0) as meeting_duration_mins,
@@ -8625,13 +8787,16 @@ def team_monthly_report(team_id):
                              'Total_Minutes', 'Breakout_Minutes', 'Main_Room_Minutes', 'Break_Minutes', 'Isolation_Minutes'])
             for r in rows:
                 meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
-                main_room = r.main_room_mins if r.main_room_mins else 0
+                main_fill = r.main_room_mins if r.main_room_mins else 0
+                main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
+                breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else (r.active_mins or 0)
+                main_room = main_fill + main_snapshot
                 # Combine breakout + main room for full working time
-                total = (r.active_mins or 0) + main_room if (r.active_mins or 0) > 0 else meeting_dur
+                total = (r.active_mins or 0) + main_fill if (r.active_mins or 0) > 0 else meeting_dur
                 status = 'Present' if total >= 300 else 'Half Day' if total >= 240 else 'Absent'
                 writer.writerow([r.event_date, r.participant_name, r.participant_email or '',
                                  status, r.first_seen_ist, r.last_seen_ist, total,
-                                 r.active_mins or 0, int(main_room), r.break_mins, r.isolation_mins])
+                                 breakout_mins, int(main_room), r.break_mins, r.isolation_mins])
 
             csv_content = output.getvalue()
             filename = f"team_{team_name.replace(' ', '_')}_{year}_{month:02d}.csv"
@@ -8645,9 +8810,12 @@ def team_monthly_report(team_id):
         data = []
         for r in rows:
             meeting_dur = r.meeting_duration_mins if hasattr(r, 'meeting_duration_mins') and r.meeting_duration_mins else 0
-            main_room = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
+            main_fill = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
+            main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
+            breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else (r.active_mins or 0)
+            main_room = main_fill + main_snapshot
             # Combine breakout + main room for full working time
-            total_mins = (r.active_mins or 0) + main_room if (r.active_mins or 0) > 0 else meeting_dur
+            total_mins = (r.active_mins or 0) + main_fill if (r.active_mins or 0) > 0 else meeting_dur
             status = 'Present' if total_mins >= 300 else 'Half Day' if total_mins >= 240 else 'Absent'
             data.append({
                 'date': str(r.event_date),
@@ -8657,7 +8825,7 @@ def team_monthly_report(team_id):
                 'first_seen_ist': r.first_seen_ist,
                 'last_seen_ist': r.last_seen_ist,
                 'active_minutes': total_mins,
-                'breakout_minutes': r.active_mins or 0,
+                'breakout_minutes': breakout_mins,
                 'main_room_minutes': int(main_room),
                 'break_minutes': int(r.break_mins),
                 'isolation_minutes': int(r.isolation_mins)
