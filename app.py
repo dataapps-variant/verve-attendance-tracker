@@ -3044,52 +3044,49 @@ def _record_alert_sent(alert_type):
 
 def send_email_alert(subject, html_body):
     """
-    Send email alert to all configured recipients via SendGrid API.
-    Falls back to Resend if SendGrid not configured.
+    Send email alert via Brevo API (primary) or Resend (fallback).
     Returns dict with results.
     """
-    # Try SendGrid first (preferred - already verified for reports)
-    # Import from report_generator which has the working SendGrid setup
-    from report_generator import SENDGRID_API_KEY as RG_SENDGRID_KEY, REPORT_EMAIL_FROM as RG_FROM
+    # Brevo API Configuration (no IP restrictions)
+    BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
-    if RG_SENDGRID_KEY and ALERT_EMAILS:
+    # Try Brevo API first
+    if BREVO_API_KEY and ALERT_EMAILS:
         try:
-            from sendgrid import SendGridAPIClient
-            from sendgrid.helpers.mail import Mail
+            from_email = ALERT_FROM_EMAIL or 'alerts@verveadvisory.com'
 
-            # Use report email sender
-            from_email = RG_FROM if RG_FROM else 'alerts@verveadvisory.com'
-
-            message = Mail(
-                from_email=from_email,
-                to_emails=ALERT_EMAILS,
-                subject=subject,
-                html_content=html_body
+            # Brevo API request
+            response = requests.post(
+                'https://api.brevo.com/v3/smtp/email',
+                headers={
+                    'api-key': BREVO_API_KEY,
+                    'Content-Type': 'application/json'
+                },
+                json={
+                    'sender': {'email': from_email},
+                    'to': [{'email': e} for e in ALERT_EMAILS],
+                    'subject': subject,
+                    'htmlContent': html_body
+                },
+                timeout=10
             )
 
-            sg = SendGridAPIClient(RG_SENDGRID_KEY)
-            response = sg.send(message)
-
-            success = response.status_code in [200, 202]
-            result = {
-                'success': success,
-                'status_code': response.status_code,
-                'recipients': ALERT_EMAILS,
-                'recipient_count': len(ALERT_EMAILS),
-                'provider': 'sendgrid'
-            }
-
+            success = response.status_code in [200, 201]
             if success:
-                print(f"[EmailAlert] Sent via SendGrid to {len(ALERT_EMAILS)} recipients: OK")
+                print(f"[EmailAlert] Sent via Brevo API to {len(ALERT_EMAILS)} recipients: OK")
+                return {
+                    'success': True,
+                    'recipients': ALERT_EMAILS,
+                    'recipient_count': len(ALERT_EMAILS),
+                    'provider': 'brevo'
+                }
             else:
-                result['error'] = f"SendGrid status: {response.status_code}"
-                print(f"[EmailAlert] SendGrid failed: {response.status_code}")
-
-            return result
+                print(f"[EmailAlert] Brevo API error: {response.status_code} - {response.text[:200]}")
+                raise Exception(f"Brevo API: {response.status_code}")
 
         except Exception as e:
+            print(f"[EmailAlert] Brevo error: {e}")
             import traceback
-            print(f"[EmailAlert] SendGrid error: {e}")
             traceback.print_exc()
             print("[EmailAlert] Trying Resend fallback...")
 
@@ -3546,17 +3543,17 @@ def email_alert_status():
             }
 
     # Determine which provider will be used
-    provider = 'sendgrid' if SENDGRID_API_KEY else ('resend' if RESEND_API_KEY else 'none')
-    from_email = REPORT_EMAIL_FROM if SENDGRID_API_KEY else ALERT_FROM_EMAIL
+    brevo_configured = bool(os.environ.get('BREVO_API_KEY'))
+    provider = 'brevo' if brevo_configured else ('resend' if RESEND_API_KEY else 'none')
 
     return jsonify({
-        'configured': (bool(SENDGRID_API_KEY) or bool(RESEND_API_KEY)) and len(ALERT_EMAILS) > 0,
+        'configured': (brevo_configured or bool(RESEND_API_KEY)) and len(ALERT_EMAILS) > 0,
         'provider': provider,
-        'sendgrid_configured': bool(SENDGRID_API_KEY),
+        'brevo_configured': brevo_configured,
         'resend_configured': bool(RESEND_API_KEY),
         'recipients': ALERT_EMAILS,
         'recipient_count': len(ALERT_EMAILS),
-        'from_email': from_email,
+        'from_email': ALERT_FROM_EMAIL,
         'settings': {
             'stale_threshold_seconds': ALERT_STALE_THRESHOLD_SECONDS,
             'rate_limit_seconds': ALERT_RATE_LIMIT_SECONDS,
