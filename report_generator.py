@@ -207,6 +207,18 @@ def generate_daily_report(report_date=None):
       WHERE event_date = '{report_date}'
         AND participant_name IS NOT NULL AND participant_name != ''
     ),
+    -- Separate lookups to avoid OR-join cartesian products
+    name_to_key AS (
+      SELECT name_key, ANY_VALUE(participant_key) as participant_key
+      FROM participant_name_map
+      GROUP BY name_key
+    ),
+    email_to_key AS (
+      SELECT email_key, ANY_VALUE(participant_key) as participant_key
+      FROM participant_name_map
+      WHERE email_key IS NOT NULL
+      GROUP BY email_key
+    ),
     -- ==========================================================
     -- WEBHOOK DATA: Main meeting join/leave times
     -- Grouped by participant_key (UUID via name bridge) so that
@@ -216,17 +228,18 @@ def generate_daily_report(report_date=None):
     -- ==========================================================
     webhook_times AS (
       SELECT
-        COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+        COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
         MAX(pe.participant_email) as participant_email,
         MIN(CASE WHEN pe.event_type = 'participant_joined' THEN TIMESTAMP(pe.event_timestamp) END) as main_join_time,
         MAX(CASE WHEN pe.event_type = 'participant_left' THEN TIMESTAMP(pe.event_timestamp) END) as main_leave_time
       FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
-      LEFT JOIN participant_name_map pnm
-        ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
-        OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
+      LEFT JOIN email_to_key etk
+        ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+      LEFT JOIN name_to_key ntk
+        ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
       WHERE pe.event_date = '{report_date}'
         AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
-      GROUP BY COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+      GROUP BY COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
     ),
     -- ==========================================================
     -- STEP 1: Clean snapshots - remove empty room names, and dedupe

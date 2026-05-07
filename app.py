@@ -6268,6 +6268,18 @@ def attendance_summary(date=None):
           WHERE event_date = '{date}'
             AND participant_name IS NOT NULL AND participant_name != ''
         ),
+        -- Separate lookups to avoid OR-join cartesian products
+        name_to_key AS (
+          SELECT name_key, ANY_VALUE(participant_key) as participant_key
+          FROM participant_name_map
+          GROUP BY name_key
+        ),
+        email_to_key AS (
+          SELECT email_key, ANY_VALUE(participant_key) as participant_key
+          FROM participant_name_map
+          WHERE email_key IS NOT NULL
+          GROUP BY email_key
+        ),
         -- Global SDK monitoring window for the day. NULL if no snapshots exist
         -- (e.g. VM down all day). Used downstream to cap "Main Room after last
         -- breakout" so a monitoring outage isn't silently converted into hours
@@ -6289,20 +6301,21 @@ def attendance_summary(date=None):
         -- main_room_time can bound users with no SDK snapshots.
         last_breakout_transition AS (
           SELECT
-            COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
             ARRAY_AGG(pe.event_type ORDER BY pe.event_timestamp DESC LIMIT 1)[OFFSET(0)] as last_event_type,
             MAX(pe.event_timestamp) as last_event_time,
             MIN(CASE WHEN pe.event_type = 'breakout_room_joined' THEN pe.event_timestamp END) as first_breakout_joined_time,
             COUNTIF(pe.event_type = 'breakout_room_joined') as breakout_joined_count
           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
-          LEFT JOIN participant_name_map pnm
-            ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
-            OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
+          LEFT JOIN email_to_key etk
+            ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+          LEFT JOIN name_to_key ntk
+            ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
           WHERE pe.event_date = '{date}'
             AND pe.event_type IN ('breakout_room_joined', 'breakout_room_left')
             AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
             AND LOWER(pe.participant_name) NOT LIKE '%scout%'
-          GROUP BY COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name)))
+          GROUP BY COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
         ),
         -- Webhook events: main meeting join/leave. Bridge the webhook name
         -- to the UUID-based participant_key used downstream, so that a
@@ -6310,15 +6323,16 @@ def attendance_summary(date=None):
         -- collapses into one row in the final output.
         webhook_events AS (
           SELECT
-            COALESCE(pnm.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
             pe.participant_name,
             COALESCE(NULLIF(pe.participant_email, ''), '') as participant_email,
             pe.event_type,
             pe.event_timestamp
           FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
-          LEFT JOIN participant_name_map pnm
-            ON LOWER(TRIM(pe.participant_name)) = pnm.name_key
-            OR NULLIF(LOWER(TRIM(pe.participant_email)), '') = pnm.email_key
+          LEFT JOIN email_to_key etk
+            ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+          LEFT JOIN name_to_key ntk
+            ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
           WHERE pe.event_date = '{date}'
             AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
             AND LOWER(pe.participant_name) NOT LIKE '%scout%'
