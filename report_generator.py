@@ -220,15 +220,46 @@ def generate_daily_report(report_date=None):
       GROUP BY email_key
     ),
     -- ==========================================================
+    -- GLOBAL SDK MONITORING WINDOW: Used to cap Main Room time
+    -- so monitoring outages don't create phantom attendance.
+    -- ==========================================================
+    monitoring_window AS (
+      SELECT
+        MIN(snapshot_time) as global_first_snapshot,
+        MAX(snapshot_time) as global_last_snapshot
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+      WHERE event_date = '{report_date}'
+    ),
+    -- ==========================================================
+    -- LAST BREAKOUT TRANSITION: Track if user explicitly returned
+    -- to main room (last event = breakout_room_left) or is still
+    -- in a breakout we can't see (last event = breakout_room_joined).
+    -- ==========================================================
+    last_breakout_transition AS (
+      SELECT
+        COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+        ARRAY_AGG(pe.event_type ORDER BY pe.event_timestamp DESC LIMIT 1)[OFFSET(0)] as last_event_type,
+        MAX(pe.event_timestamp) as last_event_time,
+        MIN(CASE WHEN pe.event_type = 'breakout_room_joined' THEN pe.event_timestamp END) as first_breakout_joined_time,
+        COUNTIF(pe.event_type = 'breakout_room_joined') as breakout_joined_count
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+      LEFT JOIN email_to_key etk
+        ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+      LEFT JOIN name_to_key ntk
+        ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
+      WHERE pe.event_date = '{report_date}'
+        AND pe.event_type IN ('breakout_room_joined', 'breakout_room_left')
+        AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
+        AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+      GROUP BY COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
+    ),
+    -- ==========================================================
     -- WEBHOOK DATA: Main meeting join/leave times
-    -- Grouped by participant_key (UUID via name bridge) so that
-    -- renamed participants collapse into a single join/leave row.
-    -- Webhook names that never appear in snapshots fall back to
-    -- their own name as the key (preserves old behavior for them).
     -- ==========================================================
     webhook_times AS (
       SELECT
         COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+        ARRAY_AGG(pe.participant_name ORDER BY pe.event_timestamp DESC LIMIT 1)[OFFSET(0)] as participant_name,
         MAX(pe.participant_email) as participant_email,
         MIN(CASE WHEN pe.event_type = 'participant_joined' THEN TIMESTAMP(pe.event_timestamp) END) as main_join_time,
         MAX(CASE WHEN pe.event_type = 'participant_left' THEN TIMESTAMP(pe.event_timestamp) END) as main_leave_time
@@ -239,17 +270,16 @@ def generate_daily_report(report_date=None):
         ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
       WHERE pe.event_date = '{report_date}'
         AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
+        AND LOWER(pe.participant_name) NOT LIKE '%scout%'
+        AND pe.event_type IN ('participant_joined', 'participant_left')
       GROUP BY COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name)))
     ),
     -- ==========================================================
-    -- STEP 1: Clean snapshots - remove empty room names, and dedupe
-    -- cases where a participant briefly appeared in two rooms at the
-    -- same snapshot_time (SDK transition artifact). Prefer breakout
-    -- rooms over Main Room so the visit timeline stays coherent.
+    -- STEP 1: Clean snapshots - EXCLUDE Main Room entries
+    -- Main Room time is synthesized from webhooks separately.
     -- ==========================================================
     snapshot_clean AS (
       SELECT
-        -- Use bridged key to unify multiple UUIDs for same person
         COALESCE(
           ntk.participant_key,
           NULLIF(rs.participant_uuid, ''),
@@ -265,6 +295,9 @@ def generate_daily_report(report_date=None):
       WHERE rs.event_date = '{report_date}'
         AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
         AND rs.room_name IS NOT NULL AND rs.room_name != ''
+        AND LOWER(rs.participant_name) NOT LIKE '%scout%'
+        AND LOWER(rs.room_name) != 'main room'
+        AND LOWER(rs.room_name) NOT LIKE '0.main%'
       QUALIFY ROW_NUMBER() OVER (
         PARTITION BY COALESCE(
           ntk.participant_key,
@@ -273,16 +306,35 @@ def generate_daily_report(report_date=None):
           LOWER(TRIM(rs.participant_name))
         ),
                      rs.snapshot_time
-        ORDER BY
-          CASE WHEN LOWER(rs.room_name) = 'main room' OR LOWER(rs.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-          rs.room_name
+        ORDER BY rs.room_name
       ) = 1
+    ),
+    -- Per-participant first/last seen in breakout rooms
+    participant_breakout_times AS (
+      SELECT
+        participant_key,
+        ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
+        MAX(participant_email) as participant_email,
+        MIN(snapshot_time) as first_breakout,
+        MAX(snapshot_time) as last_breakout
+      FROM snapshot_clean
+      GROUP BY participant_key
+    ),
+    -- Combine webhook and snapshot participants (FULL OUTER JOIN)
+    all_participants AS (
+      SELECT
+        COALESCE(w.participant_key, s.participant_key) as participant_key,
+        COALESCE(w.participant_name, s.participant_name) as participant_name,
+        COALESCE(NULLIF(w.participant_email, ''), s.participant_email, '') as participant_email,
+        w.main_join_time as main_joined,
+        w.main_leave_time as main_left,
+        s.first_breakout,
+        s.last_breakout
+      FROM webhook_times w
+      FULL OUTER JOIN participant_breakout_times s ON w.participant_key = s.participant_key
     ),
     -- ==========================================================
     -- STEP 2: Detect room transitions AND time gaps
-    -- A new visit starts when:
-    --   1. Room changes, OR
-    --   2. Time gap > 5 minutes (person left and rejoined)
     -- ==========================================================
     snapshot_transitions AS (
       SELECT *,
@@ -300,7 +352,6 @@ def generate_daily_report(report_date=None):
       SELECT *,
         SUM(CASE
           WHEN prev_room IS NULL OR room_name != prev_room THEN 1
-          -- Also start new visit if time gap > 5 minutes (300 seconds)
           WHEN prev_snapshot_time IS NOT NULL
                AND TIMESTAMP_DIFF(snapshot_time, prev_snapshot_time, SECOND) > 300 THEN 1
           ELSE 0
@@ -311,7 +362,7 @@ def generate_daily_report(report_date=None):
       FROM snapshot_transitions
     ),
     -- ==========================================================
-    -- STEP 3: Collapse into room visits, drop 0-minute entries
+    -- STEP 3: Collapse into room visits
     -- ==========================================================
     room_visits_raw AS (
       SELECT
@@ -321,7 +372,6 @@ def generate_daily_report(report_date=None):
         room_name,
         MIN(snapshot_time) as join_time,
         MAX(snapshot_time) as leave_time,
-        -- Use interval-sum (not span) so gaps within a visit are handled correctly
         CEILING(SUM(
           CASE
             WHEN prev_snapshot_time IS NULL THEN 0
@@ -332,13 +382,10 @@ def generate_daily_report(report_date=None):
         )) as duration_mins
       FROM visit_groups_raw
       GROUP BY participant_key, room_name, visit_id
-      HAVING COUNT(*) > 1  -- Need at least 2 snapshots for a meaningful visit
+      HAVING COUNT(*) > 1
     ),
     -- ==========================================================
     -- STEP 4: Re-merge consecutive same-room visits
-    -- After removing 0-min entries, "Room A → Room A" can happen
-    -- e.g., Room A [10:00-10:30], (0-min removed), Room A [10:31-11:00]
-    --   → should become Room A [10:00-11:00]
     -- ==========================================================
     remerge_transitions AS (
       SELECT *,
@@ -359,7 +406,7 @@ def generate_daily_report(report_date=None):
         ) as merge_group
       FROM remerge_transitions
     ),
-    room_visits_final AS (
+    breakout_visits_final AS (
       SELECT
         participant_key,
         MAX(participant_name) as participant_name,
@@ -367,26 +414,141 @@ def generate_daily_report(report_date=None):
         room_name,
         MIN(join_time) as join_time,
         MAX(leave_time) as leave_time,
-        FORMAT_TIMESTAMP('%H:%M', MIN(join_time), 'Asia/Kolkata') as room_joined_ist,
-        FORMAT_TIMESTAMP('%H:%M', MAX(leave_time), 'Asia/Kolkata') as room_left_ist,
-        -- Sum actual durations from room_visits_raw (already interval-based)
         SUM(duration_mins) as duration_mins
       FROM remerge_groups
       GROUP BY participant_key, room_name, merge_group
     ),
+    -- ==========================================================
+    -- MAIN ROOM TIME CALCULATION: Synthesize from webhooks
+    -- ==========================================================
+    main_room_time AS (
+      SELECT
+        ap.participant_key,
+        ap.participant_name,
+        ap.participant_email,
+        ap.main_joined,
+        COALESCE(ap.main_left, ap.last_breakout, ap.main_joined) as main_left,
+        LEAST(
+          COALESCE(ap.main_left, ap.last_breakout, ap.main_joined),
+          COALESCE(mw.global_last_snapshot, ap.main_left, ap.last_breakout, ap.main_joined)
+        ) as effective_main_left,
+        ap.first_breakout,
+        ap.last_breakout,
+        bt.last_event_type as last_breakout_event_type,
+        bt.last_event_time as last_breakout_event_time,
+        -- Main room time BEFORE first breakout
+        CASE
+          WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NOT NULL
+          THEN GREATEST(0, TIMESTAMP_DIFF(ap.first_breakout, ap.main_joined, MINUTE))
+          WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
+               AND bt.first_breakout_joined_time IS NOT NULL
+          THEN GREATEST(0, TIMESTAMP_DIFF(TIMESTAMP(bt.first_breakout_joined_time), ap.main_joined, MINUTE))
+          WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
+               AND bt.breakout_joined_count IS NULL
+               AND ap.main_left IS NOT NULL
+          THEN GREATEST(0, TIMESTAMP_DIFF(ap.main_left, ap.main_joined, MINUTE))
+          ELSE 0
+        END as main_room_before_mins,
+        -- Main room time AFTER last breakout (only if explicitly returned)
+        CASE
+          WHEN ap.last_breakout IS NOT NULL AND ap.main_left IS NOT NULL
+               AND bt.last_event_type = 'breakout_room_left'
+               AND TIMESTAMP(bt.last_event_time) >= ap.last_breakout
+          THEN GREATEST(0, TIMESTAMP_DIFF(
+            LEAST(ap.main_left, COALESCE(mw.global_last_snapshot, ap.main_left)),
+            GREATEST(ap.last_breakout, TIMESTAMP(bt.last_event_time)),
+            MINUTE))
+          ELSE 0
+        END as main_room_after_mins
+      FROM all_participants ap
+      CROSS JOIN monitoring_window mw
+      LEFT JOIN last_breakout_transition bt ON ap.participant_key = bt.participant_key
+    ),
+    -- Detect gaps between consecutive breakout visits (= time in main room)
+    breakout_with_next AS (
+      SELECT
+        participant_key,
+        leave_time as this_leave,
+        LEAD(join_time) OVER (PARTITION BY participant_key ORDER BY join_time) as next_join
+      FROM breakout_visits_final
+    ),
+    -- ==========================================================
+    -- MAIN ROOM VISITS: before, between, and after breakouts
+    -- ==========================================================
+    main_room_visits AS (
+      -- Before first breakout room
+      SELECT
+        participant_key,
+        '0.Main Room' as room_name,
+        main_joined as join_time,
+        COALESCE(first_breakout, main_left) as leave_time,
+        main_room_before_mins as duration_mins
+      FROM main_room_time
+      WHERE main_room_before_mins > 0 AND main_joined IS NOT NULL
+
+      UNION ALL
+
+      -- Between breakout rooms (gaps > 2 minutes)
+      SELECT
+        bwn.participant_key,
+        '0.Main Room' as room_name,
+        bwn.this_leave as join_time,
+        bwn.next_join as leave_time,
+        TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) as duration_mins
+      FROM breakout_with_next bwn
+      WHERE bwn.next_join IS NOT NULL
+        AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) > 2
+
+      UNION ALL
+
+      -- After last breakout room
+      SELECT
+        participant_key,
+        '0.Main Room' as room_name,
+        GREATEST(last_breakout, COALESCE(TIMESTAMP(last_breakout_event_time), last_breakout)) as join_time,
+        effective_main_left as leave_time,
+        main_room_after_mins as duration_mins
+      FROM main_room_time
+      WHERE main_room_after_mins > 0 AND last_breakout IS NOT NULL AND main_left IS NOT NULL
+    ),
+    -- ==========================================================
+    -- COMBINE ALL ROOM VISITS (breakout + main room)
+    -- ==========================================================
+    all_room_visits AS (
+      SELECT participant_key, room_name, join_time, leave_time, duration_mins
+      FROM breakout_visits_final
+      WHERE duration_mins > 0
+
+      UNION ALL
+
+      SELECT participant_key, room_name, join_time, leave_time, duration_mins
+      FROM main_room_visits
+      WHERE duration_mins > 0
+    ),
+    -- Format room visits for output
+    room_visits_formatted AS (
+      SELECT
+        participant_key,
+        room_name,
+        join_time,
+        leave_time,
+        duration_mins,
+        FORMAT_TIMESTAMP('%H:%M', join_time, 'Asia/Kolkata') as room_joined_ist,
+        FORMAT_TIMESTAMP('%H:%M', leave_time, 'Asia/Kolkata') as room_left_ist
+      FROM all_room_visits
+    ),
+    -- ==========================================================
+    -- PARTICIPANT REPORT: Aggregate all room visits
+    -- ==========================================================
     participant_report AS (
       SELECT
         rv.participant_key,
-        ARRAY_AGG(rv.participant_name ORDER BY rv.join_time DESC LIMIT 1)[OFFSET(0)] as Name,
-        COALESCE(
-          NULLIF(MAX(NULLIF(rv.participant_email, '')), ''),
-          NULLIF(MAX(NULLIF(w.participant_email, '')), ''),
-          ''
-        ) as Email,
+        mrt.participant_name as Name,
+        COALESCE(NULLIF(mrt.participant_email, ''), '') as Email,
         MIN(rv.join_time) as first_room_join_time,
         MAX(rv.leave_time) as last_room_leave_time,
-        MIN(w.main_join_time) as main_join_time,
-        MAX(w.main_leave_time) as main_leave_time,
+        mrt.main_joined as main_join_time,
+        mrt.main_left as main_leave_time,
         SUM(CASE
           WHEN LOWER(rv.room_name) LIKE '%break time%' THEN 0
           ELSE rv.duration_mins
@@ -402,11 +564,10 @@ def generate_daily_report(report_date=None):
           ' -> '
           ORDER BY rv.join_time
         ) as Room_History
-      FROM room_visits_final rv
-      LEFT JOIN webhook_times w ON rv.participant_key = w.participant_key
-      WHERE rv.participant_name NOT LIKE '%Scout%'
-        AND rv.duration_mins > 0
-      GROUP BY rv.participant_key
+      FROM room_visits_formatted rv
+      JOIN main_room_time mrt ON rv.participant_key = mrt.participant_key
+      WHERE rv.duration_mins > 0
+      GROUP BY rv.participant_key, mrt.participant_name, mrt.participant_email, mrt.main_joined, mrt.main_left
     )
     -- ==========================================================
     -- OUTPUT: One clean row per participant with summed time
