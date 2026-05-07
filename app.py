@@ -3044,12 +3044,59 @@ def _record_alert_sent(alert_type):
 
 def send_email_alert(subject, html_body):
     """
-    Send email alert to all configured recipients via Resend API.
+    Send email alert to all configured recipients via SendGrid API.
+    Falls back to Resend if SendGrid not configured.
     Returns dict with results.
     """
+    # Try SendGrid first (preferred - already verified for reports)
+    # Import from report_generator which has the working SendGrid setup
+    from report_generator import SENDGRID_API_KEY as RG_SENDGRID_KEY, REPORT_EMAIL_FROM as RG_FROM
+
+    if RG_SENDGRID_KEY and ALERT_EMAILS:
+        try:
+            from sendgrid import SendGridAPIClient
+            from sendgrid.helpers.mail import Mail
+
+            # Use report email sender
+            from_email = RG_FROM if RG_FROM else 'alerts@verveadvisory.com'
+
+            message = Mail(
+                from_email=from_email,
+                to_emails=ALERT_EMAILS,
+                subject=subject,
+                html_content=html_body
+            )
+
+            sg = SendGridAPIClient(RG_SENDGRID_KEY)
+            response = sg.send(message)
+
+            success = response.status_code in [200, 202]
+            result = {
+                'success': success,
+                'status_code': response.status_code,
+                'recipients': ALERT_EMAILS,
+                'recipient_count': len(ALERT_EMAILS),
+                'provider': 'sendgrid'
+            }
+
+            if success:
+                print(f"[EmailAlert] Sent via SendGrid to {len(ALERT_EMAILS)} recipients: OK")
+            else:
+                result['error'] = f"SendGrid status: {response.status_code}"
+                print(f"[EmailAlert] SendGrid failed: {response.status_code}")
+
+            return result
+
+        except Exception as e:
+            import traceback
+            print(f"[EmailAlert] SendGrid error: {e}")
+            traceback.print_exc()
+            print("[EmailAlert] Trying Resend fallback...")
+
+    # Fallback to Resend
     if not RESEND_API_KEY:
-        print("[EmailAlert] RESEND_API_KEY not configured")
-        return {'success': False, 'error': 'RESEND_API_KEY not configured'}
+        print("[EmailAlert] No email provider configured (SENDGRID_API_KEY or RESEND_API_KEY)")
+        return {'success': False, 'error': 'No email provider configured'}
 
     if not ALERT_EMAILS:
         print("[EmailAlert] No email recipients configured")
@@ -3076,15 +3123,16 @@ def send_email_alert(subject, html_body):
             'success': success,
             'status_code': response.status_code,
             'recipients': ALERT_EMAILS,
-            'recipient_count': len(ALERT_EMAILS)
+            'recipient_count': len(ALERT_EMAILS),
+            'provider': 'resend'
         }
 
         if success:
             result['email_id'] = response.json().get('id')
-            print(f"[EmailAlert] Sent to {len(ALERT_EMAILS)} recipients: OK")
+            print(f"[EmailAlert] Sent via Resend to {len(ALERT_EMAILS)} recipients: OK")
         else:
             result['error'] = response.text[:200]
-            print(f"[EmailAlert] Failed: {response.status_code} - {response.text[:100]}")
+            print(f"[EmailAlert] Resend failed: {response.status_code} - {response.text[:100]}")
 
         return result
 
@@ -3412,6 +3460,7 @@ def email_alert_test():
     """
     Send a test email alert to verify configuration.
     Does NOT respect rate limiting (for testing only).
+    Pass ?use_report_recipients=1 to test with report email recipients.
     """
     ist_time = get_ist_now().strftime('%I:%M %p')
     subject = "✅ Test Alert - Zoom Monitoring System"
@@ -3434,6 +3483,38 @@ def email_alert_test():
         <p style="font-size: 14px; color: #666;">Time: {ist_time} IST</p>
     </div>
     """
+
+    # Allow testing with report module directly
+    use_report = request.args.get('use_report_recipients', '0') == '1'
+    if use_report:
+        # Call report_generator's send function directly
+        import report_generator as rg
+        try:
+            # Create a minimal report object
+            test_report = {
+                'report_date': get_ist_date(),
+                'generated_at': get_ist_now().isoformat(),
+                'total_participants': 0,
+                'participants': [],
+                'csv_content': 'Test,Email\nTest Alert,test@test.com\n'
+            }
+            success = rg.send_report_email(test_report, get_ist_date())
+            return jsonify({
+                'test': True,
+                'mode': 'report_module_direct',
+                'success': success,
+                'report_to': rg.REPORT_EMAIL_TO,
+                'report_from': rg.REPORT_EMAIL_FROM,
+                'api_key_len': len(rg.SENDGRID_API_KEY) if rg.SENDGRID_API_KEY else 0
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                'test': True,
+                'mode': 'report_module_direct',
+                'error': str(e)
+            })
 
     result = send_email_alert(subject, html_body)
     return jsonify({
@@ -3464,12 +3545,18 @@ def email_alert_status():
                 'wait_seconds': wait_time
             }
 
+    # Determine which provider will be used
+    provider = 'sendgrid' if SENDGRID_API_KEY else ('resend' if RESEND_API_KEY else 'none')
+    from_email = REPORT_EMAIL_FROM if SENDGRID_API_KEY else ALERT_FROM_EMAIL
+
     return jsonify({
-        'configured': bool(RESEND_API_KEY) and len(ALERT_EMAILS) > 0,
-        'resend_api_key_set': bool(RESEND_API_KEY),
+        'configured': (bool(SENDGRID_API_KEY) or bool(RESEND_API_KEY)) and len(ALERT_EMAILS) > 0,
+        'provider': provider,
+        'sendgrid_configured': bool(SENDGRID_API_KEY),
+        'resend_configured': bool(RESEND_API_KEY),
         'recipients': ALERT_EMAILS,
         'recipient_count': len(ALERT_EMAILS),
-        'from_email': ALERT_FROM_EMAIL,
+        'from_email': from_email,
         'settings': {
             'stale_threshold_seconds': ALERT_STALE_THRESHOLD_SECONDS,
             'rate_limit_seconds': ALERT_RATE_LIMIT_SECONDS,
