@@ -436,8 +436,8 @@ def generate_daily_report(report_date=None):
         ap.last_breakout,
         bt.last_event_type as last_breakout_event_type,
         bt.last_event_time as last_breakout_event_time,
-        -- Main room time BEFORE first breakout
-        CASE
+        -- Main room time BEFORE first breakout (capped at 120 mins)
+        LEAST(120, CASE
           WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NOT NULL
           THEN GREATEST(0, TIMESTAMP_DIFF(ap.first_breakout, ap.main_joined, MINUTE))
           WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
@@ -448,9 +448,9 @@ def generate_daily_report(report_date=None):
                AND ap.main_left IS NOT NULL
           THEN GREATEST(0, TIMESTAMP_DIFF(ap.main_left, ap.main_joined, MINUTE))
           ELSE 0
-        END as main_room_before_mins,
-        -- Main room time AFTER last breakout (only if explicitly returned)
-        CASE
+        END) as main_room_before_mins,
+        -- Main room time AFTER last breakout (capped at 120 mins)
+        LEAST(120, CASE
           WHEN ap.last_breakout IS NOT NULL AND ap.main_left IS NOT NULL
                AND bt.last_event_type = 'breakout_room_left'
                AND TIMESTAMP(bt.last_event_time) >= ap.last_breakout
@@ -459,7 +459,7 @@ def generate_daily_report(report_date=None):
             GREATEST(ap.last_breakout, TIMESTAMP(bt.last_event_time)),
             MINUTE))
           ELSE 0
-        END as main_room_after_mins
+        END) as main_room_after_mins
       FROM all_participants ap
       CROSS JOIN monitoring_window mw
       LEFT JOIN last_breakout_transition bt ON ap.participant_key = bt.participant_key
@@ -471,6 +471,20 @@ def generate_daily_report(report_date=None):
         leave_time as this_leave,
         LEAD(join_time) OVER (PARTITION BY participant_key ORDER BY join_time) as next_join
       FROM breakout_visits_final
+    ),
+    -- Track all participant_left events to detect meeting exits during gaps
+    meeting_exits AS (
+      SELECT
+        COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+        TIMESTAMP(pe.event_timestamp) as exit_time
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+      LEFT JOIN email_to_key etk
+        ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+      LEFT JOIN name_to_key ntk
+        ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
+      WHERE pe.event_date = '{report_date}'
+        AND pe.event_type = 'participant_left'
+        AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
     ),
     -- ==========================================================
     -- MAIN ROOM VISITS: before, between, and after breakouts
@@ -489,15 +503,23 @@ def generate_daily_report(report_date=None):
       UNION ALL
 
       -- Between breakout rooms (gaps > 2 minutes)
+      -- Only count if no participant_left event during gap AND gap <= 2 hours
       SELECT
         bwn.participant_key,
         '0.Main Room' as room_name,
         bwn.this_leave as join_time,
         bwn.next_join as leave_time,
-        TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) as duration_mins
+        LEAST(TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE), 120) as duration_mins
       FROM breakout_with_next bwn
       WHERE bwn.next_join IS NOT NULL
         AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) > 2
+        AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) <= 120
+        AND NOT EXISTS (
+          SELECT 1 FROM meeting_exits me
+          WHERE me.participant_key = bwn.participant_key
+            AND me.exit_time > bwn.this_leave
+            AND me.exit_time < bwn.next_join
+        )
 
       UNION ALL
 

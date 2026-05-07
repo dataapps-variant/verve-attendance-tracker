@@ -6501,14 +6501,9 @@ def attendance_summary(date=None):
             ap.last_breakout,
             bt.last_event_type as last_breakout_event_type,
             bt.last_event_time as last_breakout_event_time,
-            -- Main room time BEFORE first breakout. Three priority paths:
-            --   1. SDK snapshot found a first breakout — bound by it.
-            --   2. No snapshot but webhook proves user joined a breakout —
-            --      bound by the FIRST breakout_room_joined webhook (catches
-            --      the case where SDK never saw a user who was actually in
-            --      breakouts the whole meeting).
-            --   3. No breakout activity at all — entire meeting is main room.
-            CASE
+            -- Main room time BEFORE first breakout. Capped at 120 mins (2 hours)
+            -- to prevent overnight gaps from being counted.
+            LEAST(120, CASE
               WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NOT NULL
               THEN GREATEST(0, TIMESTAMP_DIFF(ap.first_breakout, ap.main_joined, MINUTE))
               WHEN ap.main_joined IS NOT NULL AND ap.first_breakout IS NULL
@@ -6519,17 +6514,13 @@ def attendance_summary(date=None):
                    AND ap.main_left IS NOT NULL
               THEN GREATEST(0, TIMESTAMP_DIFF(ap.main_left, ap.main_joined, MINUTE))
               ELSE 0
-            END as main_room_before_mins,
-            -- Main room time AFTER last breakout. Three safeguards apply:
-            --   1. Clamp to global_last_snapshot — don't attribute anything
-            --      past the point where all SDK monitoring stopped.
-            --   2. User's LAST breakout event must be breakout_room_left.
-            --      If it's breakout_room_joined, they're still in a breakout
-            --      we can't see — do NOT credit Main Room time.
-            --   3. That breakout_room_left event must be at or after the last
-            --      breakout snapshot (proves they left the breakout we saw
-            --      them in, not an earlier one).
-            CASE
+            END) as main_room_before_mins,
+            -- Main room time AFTER last breakout. Capped at 120 mins (2 hours).
+            -- Additional safeguards:
+            --   1. Clamp to global_last_snapshot
+            --   2. User's LAST breakout event must be breakout_room_left
+            --   3. That event must be at or after the last breakout snapshot
+            LEAST(120, CASE
               WHEN ap.last_breakout IS NOT NULL AND ap.main_left IS NOT NULL
                    AND bt.last_event_type = 'breakout_room_left'
                    AND bt.last_event_time >= ap.last_breakout
@@ -6538,7 +6529,7 @@ def attendance_summary(date=None):
                 GREATEST(ap.last_breakout, bt.last_event_time),
                 MINUTE))
               ELSE 0
-            END as main_room_after_mins
+            END) as main_room_after_mins
           FROM all_participants ap
           CROSS JOIN monitoring_window mw
           LEFT JOIN last_breakout_transition bt ON ap.participant_key = bt.participant_key
@@ -6550,6 +6541,20 @@ def attendance_summary(date=None):
             leave_time as this_leave,
             LEAD(join_time) OVER (PARTITION BY participant_key ORDER BY join_time) as next_join
           FROM breakout_visits_final
+        ),
+        -- Track all participant_left events to detect meeting exits during gaps
+        meeting_exits AS (
+          SELECT
+            COALESCE(etk.participant_key, ntk.participant_key, LOWER(TRIM(pe.participant_name))) as participant_key,
+            TIMESTAMP(pe.event_timestamp) as exit_time
+          FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+          LEFT JOIN email_to_key etk
+            ON NULLIF(LOWER(TRIM(pe.participant_email)), '') = etk.email_key
+          LEFT JOIN name_to_key ntk
+            ON LOWER(TRIM(pe.participant_name)) = ntk.name_key
+          WHERE pe.event_date = '{date}'
+            AND pe.event_type = 'participant_left'
+            AND pe.participant_name IS NOT NULL AND pe.participant_name != ''
         ),
         -- Main room visits: before first breakout, between breakout rooms, after last breakout
         main_room_visits AS (
@@ -6566,17 +6571,25 @@ def attendance_summary(date=None):
           UNION ALL
 
           -- Between breakout rooms (gaps = returns to main room)
-          -- Only count gaps > 2 minutes as Main Room visits; shorter gaps are
-          -- just SDK polling jitter during room transitions.
+          -- Only count gaps > 2 minutes AND where no participant_left event
+          -- occurred during the gap (which would indicate they left the meeting).
+          -- Also cap gaps at 2 hours max to prevent overnight gaps from counting.
           SELECT
             bwn.participant_key,
             '0.Main Room' as room_name,
             bwn.this_leave as join_time,
             bwn.next_join as leave_time,
-            TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) as duration_mins
+            LEAST(TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE), 120) as duration_mins
           FROM breakout_with_next bwn
           WHERE bwn.next_join IS NOT NULL
             AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) > 2
+            AND TIMESTAMP_DIFF(bwn.next_join, bwn.this_leave, MINUTE) <= 120
+            AND NOT EXISTS (
+              SELECT 1 FROM meeting_exits me
+              WHERE me.participant_key = bwn.participant_key
+                AND me.exit_time > bwn.this_leave
+                AND me.exit_time < bwn.next_join
+            )
 
           UNION ALL
 
