@@ -30,6 +30,7 @@ import time
 import os
 import uuid as uuid_lib
 import traceback
+import urllib.parse
 
 # ==============================================================================
 # IST TIMEZONE HELPERS (UTC+5:30 - India Standard Time)
@@ -432,6 +433,33 @@ BQ_ATTENDANCE_OVERRIDES_TABLE = 'attendance_overrides'
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
 REPORT_EMAIL_FROM = os.environ.get('REPORT_EMAIL_FROM', 'reports@yourdomain.com')
 REPORT_EMAIL_TO = os.environ.get('REPORT_EMAIL_TO', '')
+
+# ==============================================================================
+# EMAIL ALERT CONFIGURATION (Resend - Free 3000/month)
+# ==============================================================================
+# Resend API for sending email alerts
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+# Comma-separated list of recipient emails
+ALERT_EMAILS = os.environ.get('ALERT_EMAILS', '').split(',') if os.environ.get('ALERT_EMAILS') else []
+ALERT_EMAILS = [e.strip() for e in ALERT_EMAILS if e.strip()]
+# Sender email (must be verified domain or use onboarding@resend.dev for testing)
+ALERT_FROM_EMAIL = os.environ.get('ALERT_FROM_EMAIL', 'onboarding@resend.dev')
+
+# Alert settings
+ALERT_STALE_THRESHOLD_SECONDS = 30  # Alert if no data for 30+ seconds
+ALERT_RATE_LIMIT_SECONDS = 300  # Max 1 alert per 5 minutes (for stale/error alerts)
+ALERT_START_HOUR = 0  # 12 AM IST (24-hour monitoring)
+ALERT_END_HOUR = 24  # 12 AM IST (24-hour monitoring)
+
+# Rate limiting state - per alert type
+_email_alert_state = {
+    'stale': {'last_time': 0, 'count_today': 0},
+    'bot_joined': {'last_time': 0, 'count_today': 0},
+    'bot_left': {'last_time': 0, 'count_today': 0},
+    'meeting_ended': {'last_time': 0, 'count_today': 0},
+    'error': {'last_time': 0, 'count_today': 0},
+    'last_reset_date': None
+}
 
 # Clients
 bq_client = None
@@ -2142,9 +2170,13 @@ def handle_participant_joined(data):
 
     print(f"[ParticipantJoined] Extracted: id={p['participant_id']}, name={p['participant_name']}, meeting={p['meeting_id']}")
 
-    # Skip scout bot
+    # Scout bot joined - send alert but skip event storage
     if is_scout_bot(p['participant_name'], p['participant_email']):
-        print(f"  -> Scout bot joined, skipping event storage")
+        print(f"  -> Scout bot joined! Sending alert...")
+        try:
+            send_alert_bot_joined(p['participant_name'], p['meeting_id'])
+        except Exception as e:
+            print(f"  -> Alert error: {e}")
         return
 
     # Validate we have required data
@@ -2190,9 +2222,13 @@ def handle_participant_left(data):
 
     print(f"[ParticipantLeft] Extracted: id={p['participant_id']}, name={p['participant_name']}")
 
-    # Skip scout bot
+    # Scout bot left - send alert but skip event storage
     if is_scout_bot(p['participant_name'], p['participant_email']):
-        print(f"  -> Scout bot left, skipping")
+        print(f"  -> Scout bot left! Sending alert...")
+        try:
+            send_alert_bot_left(p['participant_name'], p['meeting_id'])
+        except Exception as e:
+            print(f"  -> Alert error: {e}")
         return
 
     if not p['meeting_id']:
@@ -2512,6 +2548,12 @@ def handle_meeting_ended(data):
 
     print(f"[Meeting] Meeting ended: {meeting_uuid}")
     print(f"[Meeting] Meeting ID: {meeting_id}")
+
+    # Send meeting ended alert
+    try:
+        send_alert_meeting_ended(meeting_id, meeting_uuid)
+    except Exception as e:
+        print(f"[Meeting] Alert error: {e}")
 
     # Collect QoS data in background
     def collect_qos():
@@ -2962,18 +3004,422 @@ def monitor_health():
 
 
 # ═══════════════════════════════════════════════════════
-# ALERTING: Use GCP Cloud Monitoring (not SendGrid)
+# EMAIL ALERTING (Resend - Free 3000/month)
 # ═══════════════════════════════════════════════════════
-# SendGrid alert code REMOVED - Use GCP Cloud Monitoring instead:
-#
-# 1. Create Uptime Check (checks /monitor/health every 5 min)
-# 2. Create Alert Policy (triggers when status != HEALTHY)
-# 3. Add Email Notification Channels for multiple recipients
-#
-# Setup commands in README.md or run:
-#   gcloud monitoring uptime create ...
-#   gcloud monitoring policies create ...
-# ═══════════════════════════════════════════════════════
+
+def _reset_daily_alert_counters():
+    """Reset daily counters if date changed."""
+    global _email_alert_state
+    today = get_ist_date()
+    if _email_alert_state.get('last_reset_date') != today:
+        for key in ['stale', 'bot_joined', 'bot_left', 'meeting_ended', 'error']:
+            if key in _email_alert_state:
+                _email_alert_state[key]['count_today'] = 0
+        _email_alert_state['last_reset_date'] = today
+
+
+def _can_send_alert(alert_type, rate_limit_seconds=60):
+    """Check if alert can be sent (rate limiting per type)."""
+    _reset_daily_alert_counters()
+    if alert_type not in _email_alert_state:
+        return True, 0
+    now = time.time()
+    last_time = _email_alert_state[alert_type].get('last_time', 0)
+    time_since = now - last_time
+    if time_since < rate_limit_seconds:
+        return False, int(rate_limit_seconds - time_since)
+    return True, 0
+
+
+def _record_alert_sent(alert_type):
+    """Record that an alert was sent."""
+    global _email_alert_state
+    if alert_type not in _email_alert_state:
+        _email_alert_state[alert_type] = {'last_time': 0, 'count_today': 0}
+    _email_alert_state[alert_type]['last_time'] = time.time()
+    _email_alert_state[alert_type]['count_today'] += 1
+
+
+def send_email_alert(subject, html_body):
+    """
+    Send email alert to all configured recipients via Resend API.
+    Returns dict with results.
+    """
+    if not RESEND_API_KEY:
+        print("[EmailAlert] RESEND_API_KEY not configured")
+        return {'success': False, 'error': 'RESEND_API_KEY not configured'}
+
+    if not ALERT_EMAILS:
+        print("[EmailAlert] No email recipients configured")
+        return {'success': False, 'error': 'No email recipients configured (ALERT_EMAILS)'}
+
+    try:
+        response = requests.post(
+            'https://api.resend.com/emails',
+            headers={
+                'Authorization': f'Bearer {RESEND_API_KEY}',
+                'Content-Type': 'application/json'
+            },
+            json={
+                'from': ALERT_FROM_EMAIL,
+                'to': ALERT_EMAILS,
+                'subject': subject,
+                'html': html_body
+            },
+            timeout=10
+        )
+
+        success = response.status_code == 200
+        result = {
+            'success': success,
+            'status_code': response.status_code,
+            'recipients': ALERT_EMAILS,
+            'recipient_count': len(ALERT_EMAILS)
+        }
+
+        if success:
+            result['email_id'] = response.json().get('id')
+            print(f"[EmailAlert] Sent to {len(ALERT_EMAILS)} recipients: OK")
+        else:
+            result['error'] = response.text[:200]
+            print(f"[EmailAlert] Failed: {response.status_code} - {response.text[:100]}")
+
+        return result
+
+    except Exception as e:
+        print(f"[EmailAlert] Error: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+# ─────────────────────────────────────────────────────────
+# ALERT: Bot Joined Meeting
+# ─────────────────────────────────────────────────────────
+def send_alert_bot_joined(participant_name, meeting_id):
+    """Send alert when Scout Bot joins meeting."""
+    can_send, wait_time = _can_send_alert('bot_joined', rate_limit_seconds=300)
+    if not can_send:
+        print(f"[EmailAlert] Bot joined alert rate limited, wait {wait_time}s")
+        return {'sent': False, 'reason': f'Rate limited, wait {wait_time}s'}
+
+    ist_time = get_ist_now().strftime('%I:%M %p')
+    today = get_ist_date()
+    subject = f"✅ Scout Bot Joined Meeting"
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 500px; padding: 20px; border: 2px solid #27ae60; border-radius: 10px;">
+        <h2 style="color: #27ae60; margin-top: 0;">✅ Scout Bot Joined Meeting</h2>
+        <p style="font-size: 16px; color: #333;"><strong>{participant_name}</strong> has joined the meeting.</p>
+        <p style="background: #d4edda; padding: 15px; border-radius: 5px; border-left: 4px solid #27ae60;">
+            <strong>👉 Action Required:</strong><br>
+            Please open the Zoom App panel to start monitoring.
+        </p>
+        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+        <table style="font-size: 14px; color: #666;">
+            <tr><td><strong>Time:</strong></td><td>{ist_time} IST</td></tr>
+            <tr><td><strong>Meeting ID:</strong></td><td>{meeting_id}</td></tr>
+            <tr><td><strong>Date:</strong></td><td>{today}</td></tr>
+        </table>
+    </div>
+    """
+    result = send_email_alert(subject, html_body)
+    if result.get('success'):
+        _record_alert_sent('bot_joined')
+    return result
+
+
+# ─────────────────────────────────────────────────────────
+# ALERT: Bot Left Meeting
+# ─────────────────────────────────────────────────────────
+def send_alert_bot_left(participant_name, meeting_id, reason=""):
+    """Send alert when Scout Bot leaves meeting."""
+    can_send, wait_time = _can_send_alert('bot_left', rate_limit_seconds=60)
+    if not can_send:
+        print(f"[EmailAlert] Bot left alert rate limited, wait {wait_time}s")
+        return {'sent': False, 'reason': f'Rate limited, wait {wait_time}s'}
+
+    ist_time = get_ist_now().strftime('%I:%M %p')
+    today = get_ist_date()
+    reason_text = f"<p style='color: #666;'>Reason: {reason}</p>" if reason else ""
+    subject = f"⚠️ Scout Bot Left Meeting"
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 500px; padding: 20px; border: 2px solid #e67e22; border-radius: 10px;">
+        <h2 style="color: #e67e22; margin-top: 0;">⚠️ Scout Bot Left Meeting</h2>
+        <p style="font-size: 16px; color: #333;"><strong>{participant_name}</strong> has left the meeting.</p>
+        {reason_text}
+        <p style="background: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
+            <strong>⚠️ Monitoring Stopped:</strong><br>
+            No attendance data will be captured until bot rejoins.
+        </p>
+        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+        <table style="font-size: 14px; color: #666;">
+            <tr><td><strong>Time:</strong></td><td>{ist_time} IST</td></tr>
+            <tr><td><strong>Meeting ID:</strong></td><td>{meeting_id}</td></tr>
+            <tr><td><strong>Date:</strong></td><td>{today}</td></tr>
+        </table>
+    </div>
+    """
+    result = send_email_alert(subject, html_body)
+    if result.get('success'):
+        _record_alert_sent('bot_left')
+    return result
+
+
+# ─────────────────────────────────────────────────────────
+# ALERT: Meeting Ended
+# ─────────────────────────────────────────────────────────
+def send_alert_meeting_ended(meeting_id, meeting_uuid=""):
+    """Send alert when meeting ends."""
+    can_send, wait_time = _can_send_alert('meeting_ended', rate_limit_seconds=60)
+    if not can_send:
+        print(f"[EmailAlert] Meeting ended alert rate limited, wait {wait_time}s")
+        return {'sent': False, 'reason': f'Rate limited, wait {wait_time}s'}
+
+    ist_time = get_ist_now().strftime('%I:%M %p')
+    today = get_ist_date()
+    subject = f"📋 Meeting Ended - {meeting_id}"
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 500px; padding: 20px; border: 2px solid #3498db; border-radius: 10px;">
+        <h2 style="color: #3498db; margin-top: 0;">📋 Meeting Ended</h2>
+        <p style="font-size: 16px; color: #333;">The Zoom meeting has ended.</p>
+        <p style="background: #e3f2fd; padding: 15px; border-radius: 5px; border-left: 4px solid #3498db;">
+            <strong>ℹ️ Info:</strong><br>
+            Daily attendance report will be generated automatically.
+        </p>
+        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+        <table style="font-size: 14px; color: #666;">
+            <tr><td><strong>Time:</strong></td><td>{ist_time} IST</td></tr>
+            <tr><td><strong>Meeting ID:</strong></td><td>{meeting_id}</td></tr>
+            <tr><td><strong>Date:</strong></td><td>{today}</td></tr>
+        </table>
+    </div>
+    """
+    result = send_email_alert(subject, html_body)
+    if result.get('success'):
+        _record_alert_sent('meeting_ended')
+    return result
+
+
+# ─────────────────────────────────────────────────────────
+# ALERT: App Closed / Stale Data
+# ─────────────────────────────────────────────────────────
+def send_alert_stale_data(seconds_since, status):
+    """Send alert when monitoring data is stale (app closed)."""
+    can_send, wait_time = _can_send_alert('stale', rate_limit_seconds=ALERT_RATE_LIMIT_SECONDS)
+    if not can_send:
+        print(f"[EmailAlert] Stale data alert rate limited, wait {wait_time}s")
+        return {'sent': False, 'reason': f'Rate limited, wait {wait_time}s'}
+
+    ist_time = get_ist_now().strftime('%I:%M %p')
+    today = get_ist_date()
+
+    if status == 'NO_DATA':
+        alert_reason = 'No monitoring data received today'
+    else:
+        alert_reason = f'No data for {seconds_since} seconds'
+
+    subject = f"🚨 Zoom Monitoring Alert - {status}"
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 500px; padding: 20px; border: 2px solid #e74c3c; border-radius: 10px;">
+        <h2 style="color: #e74c3c; margin-top: 0;">🚨 Zoom Monitoring Alert</h2>
+        <p style="font-size: 16px; color: #333;"><strong>{alert_reason}!</strong></p>
+        <p style="color: #666;">Scout Bot may have joined the meeting, but the Zoom App panel is closed.</p>
+        <p style="background: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
+            <strong>👉 Action Required:</strong><br>
+            Please open the Zoom App panel to start monitoring.
+        </p>
+        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+        <table style="font-size: 14px; color: #666;">
+            <tr><td><strong>Time:</strong></td><td>{ist_time} IST</td></tr>
+            <tr><td><strong>Status:</strong></td><td style="color: #e74c3c;">{status}</td></tr>
+            <tr><td><strong>Date:</strong></td><td>{today}</td></tr>
+        </table>
+    </div>
+    """
+    result = send_email_alert(subject, html_body)
+    if result.get('success'):
+        _record_alert_sent('stale')
+    return result
+
+
+# ─────────────────────────────────────────────────────────
+# ALERT: System Error
+# ─────────────────────────────────────────────────────────
+def send_alert_error(error_type, error_message, context=""):
+    """Send alert for system errors."""
+    can_send, wait_time = _can_send_alert('error', rate_limit_seconds=ALERT_RATE_LIMIT_SECONDS)
+    if not can_send:
+        print(f"[EmailAlert] Error alert rate limited, wait {wait_time}s")
+        return {'sent': False, 'reason': f'Rate limited, wait {wait_time}s'}
+
+    ist_time = get_ist_now().strftime('%I:%M %p')
+    today = get_ist_date()
+    context_html = f"<p style='color: #666;'>Context: {context}</p>" if context else ""
+    subject = f"❌ System Error - {error_type}"
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 500px; padding: 20px; border: 2px solid #e74c3c; border-radius: 10px;">
+        <h2 style="color: #e74c3c; margin-top: 0;">❌ System Error</h2>
+        <p style="font-size: 16px; color: #333;"><strong>{error_type}</strong></p>
+        <p style="background: #fce4ec; padding: 15px; border-radius: 5px; border-left: 4px solid #e74c3c; font-family: monospace; font-size: 12px; word-break: break-all;">
+            {error_message[:500]}
+        </p>
+        {context_html}
+        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+        <table style="font-size: 14px; color: #666;">
+            <tr><td><strong>Time:</strong></td><td>{ist_time} IST</td></tr>
+            <tr><td><strong>Date:</strong></td><td>{today}</td></tr>
+        </table>
+    </div>
+    """
+    result = send_email_alert(subject, html_body)
+    if result.get('success'):
+        _record_alert_sent('error')
+    return result
+
+
+# ─────────────────────────────────────────────────────────
+# Check and Send Stale Alert (called by Cloud Scheduler)
+# ─────────────────────────────────────────────────────────
+def check_and_send_stale_alert():
+    """
+    Check if monitoring is stale and send email alert if needed.
+    Called by Cloud Scheduler every minute.
+    """
+    today = get_ist_date()
+
+    try:
+        client = get_bq_client()
+        query = f"""
+        SELECT
+          COUNT(*) as snapshot_count,
+          TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(snapshot_time), SECOND) as seconds_since_last
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.room_snapshots`
+        WHERE event_date = '{today}'
+        """
+        result = list(client.query(query).result())
+        row = result[0] if result else {}
+
+        snapshot_count = row.get('snapshot_count', 0) or 0
+        seconds_since = row.get('seconds_since_last', None)
+
+        # Determine if alert needed
+        needs_alert = False
+        status = 'HEALTHY'
+
+        if snapshot_count == 0:
+            needs_alert = True
+            status = 'NO_DATA'
+        elif seconds_since is not None and seconds_since > ALERT_STALE_THRESHOLD_SECONDS:
+            needs_alert = True
+            status = 'STALE'
+
+        if not needs_alert:
+            return {
+                'alert_sent': False,
+                'reason': 'Monitoring is healthy',
+                'status': status,
+                'seconds_since_last': seconds_since
+            }
+
+        # Send stale alert
+        send_result = send_alert_stale_data(seconds_since, status)
+
+        return {
+            'alert_sent': send_result.get('success', False),
+            'status': status,
+            'seconds_since_last': seconds_since,
+            'send_result': send_result
+        }
+
+    except Exception as e:
+        print(f"[EmailAlert] Error checking health: {e}")
+        return {
+            'alert_sent': False,
+            'reason': f'Error: {str(e)}',
+            'status': 'ERROR'
+        }
+
+
+@app.route('/alert/email/check', methods=['GET', 'POST'])
+def email_alert_check():
+    """
+    Cloud Scheduler calls this every minute.
+    Checks if monitoring is stale and sends email alert if needed.
+    """
+    result = check_and_send_stale_alert()
+    print(f"[EmailAlert] Check result: {result}")
+    return jsonify(result)
+
+
+@app.route('/alert/email/test', methods=['POST'])
+def email_alert_test():
+    """
+    Send a test email alert to verify configuration.
+    Does NOT respect rate limiting (for testing only).
+    """
+    ist_time = get_ist_now().strftime('%I:%M %p')
+    subject = "✅ Test Alert - Zoom Monitoring System"
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 500px; padding: 20px; border: 2px solid #27ae60; border-radius: 10px;">
+        <h2 style="color: #27ae60; margin-top: 0;">✅ Test Alert</h2>
+        <p style="font-size: 16px; color: #333;">This is a test message from the Zoom Monitoring System.</p>
+        <p style="background: #d4edda; padding: 15px; border-radius: 5px; border-left: 4px solid #27ae60;">
+            <strong>Email alerts are working!</strong><br>
+            You will receive alerts for:
+            <ul style="margin: 10px 0;">
+                <li>Bot joined meeting</li>
+                <li>Bot left meeting</li>
+                <li>Meeting ended</li>
+                <li>App closed (no data)</li>
+                <li>System errors</li>
+            </ul>
+        </p>
+        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+        <p style="font-size: 14px; color: #666;">Time: {ist_time} IST</p>
+    </div>
+    """
+
+    result = send_email_alert(subject, html_body)
+    return jsonify({
+        'test': True,
+        'recipients_configured': len(ALERT_EMAILS),
+        'recipients': ALERT_EMAILS,
+        'result': result
+    })
+
+
+@app.route('/alert/email/status', methods=['GET'])
+def email_alert_status():
+    """
+    Get email alert configuration and status.
+    """
+    _reset_daily_alert_counters()
+    ist_now = get_ist_now()
+    ist_hour = ist_now.hour
+
+    # Get status for each alert type
+    alert_types_status = {}
+    for alert_type in ['stale', 'bot_joined', 'bot_left', 'meeting_ended', 'error']:
+        if alert_type in _email_alert_state:
+            can_send, wait_time = _can_send_alert(alert_type, 60)
+            alert_types_status[alert_type] = {
+                'count_today': _email_alert_state[alert_type].get('count_today', 0),
+                'can_send': can_send,
+                'wait_seconds': wait_time
+            }
+
+    return jsonify({
+        'configured': bool(RESEND_API_KEY) and len(ALERT_EMAILS) > 0,
+        'resend_api_key_set': bool(RESEND_API_KEY),
+        'recipients': ALERT_EMAILS,
+        'recipient_count': len(ALERT_EMAILS),
+        'from_email': ALERT_FROM_EMAIL,
+        'settings': {
+            'stale_threshold_seconds': ALERT_STALE_THRESHOLD_SECONDS,
+            'rate_limit_seconds': ALERT_RATE_LIMIT_SECONDS,
+            'alert_hours': '24/7'
+        },
+        'alert_types': alert_types_status,
+        'current_hour_ist': ist_hour
+    })
 
 
 # Rate limiter for signature error logging
