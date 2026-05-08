@@ -7930,11 +7930,19 @@ def team_attendance(team_id, date):
             main_fill = r.main_room_mins if r.main_room_mins else 0
             main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
             breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else r.total_active_mins
-            main_room = main_fill + main_snapshot
             meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
+
+            # Cap main_fill to prevent phantom time from webhook span inflation.
+            if r.total_active_mins > 0:
+                max_main_fill = max(60, int(r.total_active_mins * 0.2))
+                main_fill = min(main_fill, max_main_fill)
+
+            main_room = main_fill + main_snapshot
             # Combine tracked active time with webhook gap-fill for untracked main room.
             # This gives the full working time, not just breakout room time
             total_mins = r.total_active_mins + main_fill if r.total_active_mins > 0 else meeting_dur
+            # Final sanity cap: 12 hours max per day
+            total_mins = min(total_mins, 720)
 
             # Hour-based status: >=5hr=Present, 4-5hr=Half Day, <4hr=Absent
             if total_mins >= 300:
@@ -8398,8 +8406,16 @@ def team_attendance_range(team_id):
             main_fill = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
             main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
             breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else r.active_mins
+
+            # Cap main_fill to prevent phantom time from webhook span inflation.
+            if r.active_mins > 0:
+                max_main_fill = max(60, int(r.active_mins * 0.2))
+                main_fill = min(main_fill, max_main_fill)
+
             main_room = main_fill + main_snapshot
             total_mins = r.active_mins + main_fill if r.active_mins > 0 else meeting_dur
+            # Final sanity cap: 12 hours max per day
+            total_mins = min(total_mins, 720)
             if total_mins >= 300:
                 status = 'Present'
             elif total_mins >= 240:
@@ -8942,9 +8958,17 @@ def team_monthly_report(team_id):
                 main_fill = r.main_room_mins if r.main_room_mins else 0
                 main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
                 breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else (r.active_mins or 0)
+
+                # Cap main_fill to prevent phantom time (same logic as JSON response)
+                if (r.active_mins or 0) > 0:
+                    max_main_fill = max(60, int((r.active_mins or 0) * 0.2))
+                    main_fill = min(main_fill, max_main_fill)
+
                 main_room = main_fill + main_snapshot
                 # Combine breakout + main room for full working time
                 total = (r.active_mins or 0) + main_fill if (r.active_mins or 0) > 0 else meeting_dur
+                # Final sanity cap: 12 hours max
+                total = min(total, 720)
                 status = 'Present' if total >= 300 else 'Half Day' if total >= 240 else 'Absent'
                 writer.writerow([r.event_date, r.participant_name, r.participant_email or '',
                                  status, r.first_seen_ist, r.last_seen_ist, total,
@@ -8965,9 +8989,21 @@ def team_monthly_report(team_id):
             main_fill = r.main_room_mins if hasattr(r, 'main_room_mins') and r.main_room_mins else 0
             main_snapshot = r.main_snapshot_mins if hasattr(r, 'main_snapshot_mins') and r.main_snapshot_mins else 0
             breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else (r.active_mins or 0)
+
+            # Cap main_fill to prevent phantom time from webhook span inflation.
+            # If snapshot coverage exists, webhook-inferred Main Room time shouldn't
+            # exceed a reasonable fraction of tracked breakout time (max 60 mins or 20%).
+            # This handles cases where meeting span is huge (e.g., 00:30-22:42) but
+            # actual presence was much shorter with gaps for lunch/disconnections.
+            if (r.active_mins or 0) > 0:
+                max_main_fill = max(60, int((r.active_mins or 0) * 0.2))
+                main_fill = min(main_fill, max_main_fill)
+
             main_room = main_fill + main_snapshot
             # Combine breakout + main room for full working time
             total_mins = (r.active_mins or 0) + main_fill if (r.active_mins or 0) > 0 else meeting_dur
+            # Final sanity cap: no single day can exceed 12 hours (720 mins)
+            total_mins = min(total_mins, 720)
             status = 'Present' if total_mins >= 300 else 'Half Day' if total_mins >= 240 else 'Absent'
             data.append({
                 'date': str(r.event_date),
