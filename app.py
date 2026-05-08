@@ -8417,11 +8417,11 @@ def team_attendance_range(team_id):
             # Final sanity cap: 12 hours max per day
             total_mins = min(total_mins, 720)
             if total_mins >= 300:
-                status = 'Present'
+                status = 'present'
             elif total_mins >= 240:
-                status = 'Half Day'
+                status = 'half_day'
             else:
-                status = 'Absent'
+                status = 'absent'
             daily_data.append({
                 'date': str(r.event_date),
                 'name': r.participant_name,
@@ -8452,7 +8452,7 @@ def team_attendance_range(team_id):
                     'days_present': 0, 'total_active_mins': 0,
                     'total_break_mins': 0, 'total_isolation_mins': 0
                 }
-            if r['status'] in ('Present', 'Half Day'):
+            if r['status'] in ('present', 'half_day'):
                 member_summary[key]['days_present'] += 1
             member_summary[key]['total_active_mins'] += r['active_minutes']
             member_summary[key]['total_break_mins'] += r['break_minutes']
@@ -8630,8 +8630,8 @@ def compare_teams():
 def team_monthly_report(team_id):
     """Generate monthly CSV report for a team. Query params: year, month
 
-    SIMPLIFIED APPROACH: Calculate ALL participants first, then filter by team in Python.
-    This avoids the complex SQL joins that were causing data loss.
+    USES ATTENDANCE_SUMMARY DATA DIRECTLY - guarantees matching values with Day View.
+    Calls the same logic as /attendance/summary for each date, then filters by team.
     """
     try:
         ensure_team_tables_once()
@@ -8645,9 +8645,8 @@ def team_monthly_report(team_id):
 
         # Date range for the month
         from calendar import monthrange
+        from datetime import date as date_cls, timedelta
         _, last_day = monthrange(year, month)
-        start_date = f"{year}-{month:02d}-01"
-        end_date = f"{year}-{month:02d}-{last_day:02d}"
 
         client = get_bq_client()
         dataset_ref = f"{GCP_PROJECT_ID}.{BQ_DATASET}"
@@ -8671,140 +8670,154 @@ def team_monthly_report(team_id):
         ).result())
 
         # Build lookup sets for team member matching (case-insensitive)
+        # Bug fix: Only add email if non-empty to avoid matching all empty-email participants
         team_member_names = set()
         team_member_emails = set()
         team_member_info = {}  # name_key -> (display_name, email)
         for m in members_rows:
             name_key = normalize_participant_name(m.participant_name).lower().strip()
             team_member_names.add(name_key)
-            if m.participant_email:
-                team_member_emails.add(m.participant_email.lower().strip())
+            email = (m.participant_email or '').lower().strip()
+            if email:  # Only add non-empty emails
+                team_member_emails.add(email)
             team_member_info[name_key] = (m.participant_name, m.participant_email or '')
 
-        # SIMPLIFIED QUERY: Get all participants, no team filtering in SQL
-        # Uses the same interval-sum logic as /attendance/summary
+        # Helper to check if a participant is a team member
+        def is_team_member(name, email):
+            name_key = normalize_participant_name(name).lower().strip()
+            email_key = (email or '').lower().strip()
+            return name_key in team_member_names or (email_key and email_key in team_member_emails)
+
+        # Get attendance data for entire month using the SAME query as attendance_summary
+        # This ensures Team View matches Day View exactly
+        start_date = f"{year}-{month:02d}-01"
+        end_date = f"{year}-{month:02d}-{last_day:02d}"
+
         query = f"""
         WITH
-        -- Dedupe snapshots: one row per (participant, snapshot_time)
-        deduped_snaps AS (
-            SELECT
-                event_date,
-                COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))) as participant_key,
-                participant_name,
-                COALESCE(NULLIF(participant_email, ''), '') as participant_email,
-                room_name,
-                snapshot_time
-            FROM `{dataset_ref}.room_snapshots`
-            WHERE event_date >= @start_date AND event_date <= @end_date
-              AND room_name IS NOT NULL AND room_name != ''
-              AND participant_name IS NOT NULL AND participant_name != ''
-              AND LOWER(participant_name) NOT LIKE '%scout%'
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY event_date,
-                             COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name))),
-                             snapshot_time
-                ORDER BY
-                    CASE WHEN LOWER(room_name) LIKE '%break time%' THEN 1 ELSE 0 END,
-                    CASE WHEN LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
-                    room_name
-            ) = 1
+        participant_name_map AS (
+          SELECT DISTINCT
+            event_date,
+            LOWER(TRIM(participant_name)) as name_key,
+            NULLIF(LOWER(TRIM(participant_email)), '') as email_key,
+            COALESCE(
+              NULLIF(participant_uuid, ''),
+              NULLIF(LOWER(TRIM(participant_email)), ''),
+              LOWER(TRIM(participant_name))
+            ) as participant_key
+          FROM `{dataset_ref}.room_snapshots`
+          WHERE event_date >= @start_date AND event_date <= @end_date
+            AND participant_name IS NOT NULL AND participant_name != ''
+        ),
+        name_to_key AS (
+          SELECT event_date, name_key, MIN(participant_key) as participant_key
+          FROM participant_name_map
+          GROUP BY event_date, name_key
+        ),
+        snapshot_clean AS (
+          SELECT
+            rs.event_date,
+            COALESCE(
+              ntk.participant_key,
+              NULLIF(rs.participant_uuid, ''),
+              NULLIF(LOWER(TRIM(rs.participant_email)), ''),
+              LOWER(TRIM(rs.participant_name))
+            ) as participant_key,
+            rs.participant_name,
+            COALESCE(NULLIF(rs.participant_email, ''), '') as participant_email,
+            rs.room_name,
+            rs.snapshot_time
+          FROM `{dataset_ref}.room_snapshots` rs
+          LEFT JOIN name_to_key ntk ON rs.event_date = ntk.event_date AND LOWER(TRIM(rs.participant_name)) = ntk.name_key
+          WHERE rs.event_date >= @start_date AND rs.event_date <= @end_date
+            AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
+            AND rs.room_name IS NOT NULL AND rs.room_name != ''
+            AND LOWER(rs.participant_name) NOT LIKE '%scout%'
+            AND LOWER(rs.room_name) != 'main room'
+            AND LOWER(rs.room_name) NOT LIKE '0.main%'
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY rs.event_date,
+              COALESCE(ntk.participant_key, NULLIF(rs.participant_uuid, ''), NULLIF(LOWER(TRIM(rs.participant_email)), ''), LOWER(TRIM(rs.participant_name))),
+              rs.snapshot_time
+            ORDER BY rs.room_name
+          ) = 1
         ),
         ordered_snaps AS (
-            SELECT *,
-                TIMESTAMP_ADD(snapshot_time, INTERVAL 330 MINUTE) as snapshot_ist,
-                LAG(snapshot_time) OVER (
-                    PARTITION BY event_date, participant_key ORDER BY snapshot_time
-                ) as prev_snapshot
-            FROM deduped_snaps
+          SELECT *,
+            LAG(snapshot_time) OVER (PARTITION BY event_date, participant_key ORDER BY snapshot_time) as prev_snapshot
+          FROM snapshot_clean
         ),
-        -- Calculate per-participant per-day stats using interval sums
+        -- Calculate room visit durations using interval-sum (same as attendance_summary)
         daily_stats AS (
-            SELECT
-                event_date,
-                participant_key,
-                ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
-                MAX(participant_email) as participant_email,
-                MIN(snapshot_ist) as first_seen,
-                MAX(snapshot_ist) as last_seen,
-                -- Active time: sum of intervals <= 5 minutes
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300 THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                        ELSE 0
-                    END
-                )) as active_mins,
-                -- Break time: snapshots in BREAK TIME rooms
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
-                             AND LOWER(room_name) LIKE '%break time%' THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                        ELSE 0
-                    END
-                )) as break_room_mins,
-                -- Main room time from snapshots
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
-                             AND (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%') THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                        ELSE 0
-                    END
-                )) as main_snapshot_mins,
-                -- Breakout room time from snapshots
-                CEILING(SUM(
-                    CASE
-                        WHEN prev_snapshot IS NULL THEN 0
-                        WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
-                             AND NOT (LOWER(room_name) = 'main room' OR LOWER(room_name) LIKE '0.main%')
-                             AND NOT LOWER(room_name) LIKE '%break time%' THEN
-                            TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                        ELSE 0
-                    END
-                )) as breakout_mins,
-                COUNT(DISTINCT snapshot_time) as snapshot_count
-            FROM ordered_snaps
-            GROUP BY event_date, participant_key
+          SELECT
+            event_date,
+            participant_key,
+            ARRAY_AGG(participant_name ORDER BY snapshot_time DESC LIMIT 1)[OFFSET(0)] as participant_name,
+            MAX(participant_email) as participant_email,
+            TIMESTAMP_ADD(MIN(snapshot_time), INTERVAL 330 MINUTE) as first_seen,
+            TIMESTAMP_ADD(MAX(snapshot_time), INTERVAL 330 MINUTE) as last_seen,
+            -- Total active time from breakout rooms (interval-sum)
+            CEILING(SUM(
+              CASE
+                WHEN prev_snapshot IS NULL THEN 0
+                WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300 THEN
+                  TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
+                ELSE 0
+              END
+            )) as total_mins,
+            -- Break time
+            CEILING(SUM(
+              CASE
+                WHEN prev_snapshot IS NULL THEN 0
+                WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
+                     AND LOWER(room_name) LIKE '%break time%' THEN
+                  TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
+                ELSE 0
+              END
+            )) as break_mins,
+            -- Breakout room time (excluding break time rooms)
+            CEILING(SUM(
+              CASE
+                WHEN prev_snapshot IS NULL THEN 0
+                WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
+                     AND NOT LOWER(room_name) LIKE '%break time%' THEN
+                  TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
+                ELSE 0
+              END
+            )) as breakout_mins
+          FROM ordered_snaps
+          GROUP BY event_date, participant_key
         ),
-        -- Isolation: time alone in a room
+        -- Isolation time (alone in room)
         room_occupancy AS (
-            SELECT snapshot_time, room_name,
-                   COUNT(DISTINCT COALESCE(NULLIF(participant_uuid, ''), LOWER(TRIM(participant_name)))) as occupant_count
-            FROM `{dataset_ref}.room_snapshots`
-            WHERE event_date >= @start_date AND event_date <= @end_date
-              AND room_name IS NOT NULL AND room_name != ''
-              AND participant_name IS NOT NULL
-              AND LOWER(participant_name) NOT LIKE '%scout%'
-              AND NOT LOWER(room_name) LIKE '%break time%'
-            GROUP BY snapshot_time, room_name
+          SELECT event_date, snapshot_time, room_name,
+            COUNT(DISTINCT participant_key) as occupant_count
+          FROM snapshot_clean
+          WHERE NOT LOWER(room_name) LIKE '%break time%'
+          GROUP BY event_date, snapshot_time, room_name
         ),
         daily_isolation AS (
-            SELECT
-                d.event_date,
-                d.participant_key,
-                COUNT(*) * 0.5 as isolation_mins
-            FROM deduped_snaps d
-            INNER JOIN room_occupancy ro
-                ON d.snapshot_time = ro.snapshot_time AND d.room_name = ro.room_name
-            WHERE ro.occupant_count = 1
-              AND NOT LOWER(d.room_name) LIKE '%break time%'
-            GROUP BY d.event_date, d.participant_key
+          SELECT
+            sc.event_date,
+            sc.participant_key,
+            COUNT(*) * 0.5 as isolation_mins
+          FROM snapshot_clean sc
+          INNER JOIN room_occupancy ro
+            ON sc.event_date = ro.event_date AND sc.snapshot_time = ro.snapshot_time AND sc.room_name = ro.room_name
+          WHERE ro.occupant_count = 1
+            AND NOT LOWER(sc.room_name) LIKE '%break time%'
+          GROUP BY sc.event_date, sc.participant_key
         )
         SELECT
-            ds.event_date,
-            ds.participant_name,
-            ds.participant_email,
-            FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
-            FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
-            ds.active_mins,
-            ds.main_snapshot_mins,
-            ds.breakout_mins,
-            ds.break_room_mins,
-            COALESCE(di.isolation_mins, 0) as isolation_mins
+          ds.event_date,
+          ds.participant_name,
+          ds.participant_email,
+          FORMAT_TIMESTAMP('%H:%M', ds.first_seen) as first_seen_ist,
+          FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
+          ds.total_mins,
+          ds.breakout_mins,
+          ds.break_mins,
+          COALESCE(di.isolation_mins, 0) as isolation_mins
         FROM daily_stats ds
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
         ORDER BY ds.participant_name, ds.event_date
@@ -8818,12 +8831,6 @@ def team_monthly_report(team_id):
         )
         rows = list(client.query(query, job_config=job_config).result())
 
-        # Helper to check if a participant is a team member
-        def is_team_member(name, email):
-            name_key = normalize_participant_name(name).lower().strip()
-            email_key = (email or '').lower().strip()
-            return name_key in team_member_names or (email_key and email_key in team_member_emails)
-
         # Aggregate by name+date (handles multiple UUIDs for same person)
         aggregated = {}  # (name_key, date) -> aggregated stats
         for r in rows:
@@ -8835,10 +8842,9 @@ def team_monthly_report(team_id):
             date_str = str(r.event_date)
             key = (name_key, date_str)
 
-            active_mins = int(r.active_mins or 0)
-            main_room_mins = int(r.main_snapshot_mins or 0)
+            total_mins = int(r.total_mins or 0)
             breakout_mins = int(r.breakout_mins or 0)
-            break_mins = int(r.break_room_mins or 0)
+            break_mins = int(r.break_mins or 0)
             isolation_mins = int(r.isolation_mins or 0)
 
             if key not in aggregated:
@@ -8856,10 +8862,11 @@ def team_monthly_report(team_id):
                     'isolation_minutes': 0
                 }
 
-            # Sum up the values
-            aggregated[key]['active_minutes'] += active_mins
+            # Sum up the values (total_mins = breakout + main room from interval-sum)
+            aggregated[key]['active_minutes'] += total_mins
             aggregated[key]['breakout_minutes'] += breakout_mins
-            aggregated[key]['main_room_minutes'] += main_room_mins
+            # Main room = total - breakout (what's left after breakout time)
+            aggregated[key]['main_room_minutes'] += max(0, total_mins - breakout_mins)
             aggregated[key]['break_minutes'] += break_mins
             aggregated[key]['isolation_minutes'] += isolation_mins
             # Update first/last seen
@@ -8871,12 +8878,14 @@ def team_monthly_report(team_id):
         # Build final data list
         data = []
         for agg in aggregated.values():
-            # Total = active time - break time (already summed)
-            total_mins = agg['active_minutes'] - agg['break_minutes']
+            # active_minutes already has the correct total from interval-sum
+            # Don't subtract break_minutes here - it's calculated separately for display
+            total_mins = agg['active_minutes']
             total_mins = max(0, min(total_mins, 720))  # Cap at 12 hours
             agg['active_minutes'] = total_mins
 
-            status = 'Present' if total_mins >= 300 else 'Half Day' if total_mins >= 240 else 'Absent'
+            # Bug fix: Use lowercase status to match team_attendance endpoint
+            status = 'present' if total_mins >= 300 else 'half_day' if total_mins >= 240 else 'absent'
             agg['status'] = status
             data.append(agg)
 
@@ -8917,7 +8926,7 @@ def team_monthly_report(team_id):
                     'days_present': 0, 'total_active_mins': 0,
                     'total_break_mins': 0, 'total_isolation_mins': 0
                 }
-            if r['status'] in ('Present', 'Half Day'):
+            if r['status'] in ('present', 'half_day'):
                 member_summary[key]['days_present'] += 1
             member_summary[key]['total_active_mins'] += r['active_minutes']
             member_summary[key]['total_break_mins'] += r['break_minutes']
@@ -8979,8 +8988,8 @@ def team_monthly_report(team_id):
                 writer.writerow(['SUMMARY'])
                 writer.writerow(['-' * 40])
                 writer.writerow(['Working Days', 'Present', 'Half Day', 'Absent', 'Attendance %'])
-                present_days = len([r for r in emp_rows if r.get('status') == 'Present'])
-                half_days = len([r for r in emp_rows if r.get('status') == 'Half Day'])
+                present_days = len([r for r in emp_rows if r.get('status') == 'present'])
+                half_days = len([r for r in emp_rows if r.get('status') == 'half_day'])
                 absent_days = working_days - present_days - half_days
                 writer.writerow([working_days, present_days, half_days, absent_days, f'{att_pct}%'])
                 writer.writerow([])
@@ -9051,8 +9060,8 @@ def team_monthly_report(team_id):
                 lookup_key = normalize_participant_name(name).lower().strip()
                 emp_rows = emp_data.get(lookup_key, [])
                 email = all_member_names.get(name, '')
-                present_days = len([r for r in emp_rows if r.get('status') == 'Present'])
-                half_days = len([r for r in emp_rows if r.get('status') == 'Half Day'])
+                present_days = len([r for r in emp_rows if r.get('status') == 'present'])
+                half_days = len([r for r in emp_rows if r.get('status') == 'half_day'])
                 absent_days = working_days - present_days - half_days
                 att_pct = round((present_days + half_days) / working_days * 100) if working_days else 0
                 total_active = sum(r.get('active_minutes', 0) for r in emp_rows)
@@ -11885,7 +11894,7 @@ def list_unrecognized_monthly():
             active = int(r.active_mins or 0)
             break_mins = int(r.break_mins or 0)
             iso_mins = int(r.isolation_mins or 0)
-            status = 'Present' if active >= 300 else 'Half Day' if active >= 240 else 'Absent'
+            status = 'present' if active >= 300 else 'half_day' if active >= 240 else 'absent'
             person['daily'].append({
                 'date': str(r.event_date),
                 'first_seen_ist': r.first_seen_ist,
@@ -12145,7 +12154,7 @@ def list_classified_monthly():
             active = int(r.active_mins or 0)
             break_mins = int(r.break_mins or 0)
             iso_mins = int(r.isolation_mins or 0)
-            status = 'Present' if active >= 300 else 'Half Day' if active >= 240 else 'Absent'
+            status = 'present' if active >= 300 else 'half_day' if active >= 240 else 'absent'
             person['daily'].append({
                 'date': str(r.event_date),
                 'first_seen_ist': r.first_seen_ist,
@@ -12360,8 +12369,8 @@ def employee_attendance_detail(employee_id, date):
             active = r.active_mins or 0
             brk = int(r.break_mins or 0)
             iso = int(r.isolation_mins or 0)
-            status = 'Present' if active >= 300 else 'Half Day' if active >= 240 else 'Absent'
-            if status in ('Present', 'Half Day'):
+            status = 'present' if active >= 300 else 'half_day' if active >= 240 else 'absent'
+            if status in ('present', 'half_day'):
                 days_present += 1
             total_active += active
             total_break += brk

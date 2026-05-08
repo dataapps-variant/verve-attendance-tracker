@@ -181,6 +181,13 @@ function writeCell(ws, r, c, value, style) {
   expandRange(ws, r, c);
 }
 
+// Bug fix: Helper for correct ordinal suffix (1st, 2nd, 3rd, 4th, 21st, 22nd, etc.)
+function ordinal(n) {
+  const s = ['th', 'st', 'nd', 'rd'];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
 // ── Main export ──────────────────────────────────────────
 /**
  * @param {Object} monthlyData  - response from /teams/<id>/report/monthly
@@ -194,9 +201,10 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   const dailyData = Array.isArray(monthlyData?.daily_data) ? monthlyData.daily_data : [];
 
   // Holidays — date -> description
+  // Bug fix: Use ?? instead of || to preserve empty string descriptions
   const holidayMap = {};
   (monthlyData?.holidays || []).forEach(h => {
-    if (h?.date) holidayMap[h.date] = h.description || 'Holiday';
+    if (h?.date) holidayMap[h.date] = h.description ?? 'Holiday';
   });
 
   // ── Build the list of dates (weekdays in month + any date that has data) ──
@@ -220,11 +228,14 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
     if (!r?.name || !r?.date) return;
     const mins = Number(r.active_minutes) || 0;
     const isoMins = Number(r.isolation_minutes) || 0;
+    const brkMins = Number(r.break_minutes) || 0;
     lookup[`${r.name}|${r.date}`] = {
       minutes: mins,
       hours: mins / 60,
       isolationMinutes: isoMins,
       isolationHours: isoMins / 60,
+      breakMinutes: brkMins,
+      breakHours: brkMins / 60,
       first: r.first_seen_ist || '',
       last: r.last_seen_ist || '',
     };
@@ -373,7 +384,7 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   // Notes section (2 blank rows below)
   const noteStart = grandRow + 2;
   const monthName = MONTH_NAMES[month - 1];
-  const reportPeriod = `1st to ${daysInMonth}th ${monthName} ${year}`;
+  const reportPeriod = `1st to ${ordinal(daysInMonth)} ${monthName} ${year}`;
 
   writeCell(pivotWs, noteStart,     0, 'Note:', NOTE_LABEL_STYLE);
   writeCell(pivotWs, noteStart,     1, 'Report is from', NOTE_LABEL_STYLE);
@@ -409,7 +420,8 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   pivotWs['!cols'] = pivotCols;
 
   // Freeze the header rows and first column
-  pivotWs['!freeze'] = { xSplit: 2, ySplit: 3 };
+  // Bug fix: Use correct xlsx-js-style API for freeze panes
+  pivotWs['!views'] = [{ state: 'frozen', xSplit: 2, ySplit: 3 }];
 
   // ════════════════════════════════════════════════════════
   // SHEET 3 — "Isolation" (pivot of isolation hours per person per day)
@@ -486,14 +498,21 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   });
 
   // Grand Total row
+  // Bug fix: Write 'H' for holiday columns (matching Pivot sheet behavior)
   const isoGrandRow = 3 + names.length;
   writeCell(isoWs, isoGrandRow, 0, 'Grand Total', GRAND_TOTAL_STYLE);
   writeCell(isoWs, isoGrandRow, 1, '', GRAND_TOTAL_STYLE);
   let isoGrandSum = 0;
   isoColTotals.forEach((t, i) => {
-    const v = Number(t.toFixed(2));
-    isoGrandSum += t;
-    writeCell(isoWs, isoGrandRow, 2 + i, v, GRAND_TOTAL_STYLE);
+    const ds = dates[i];
+    const isHoliday = !!holidayMap[ds];
+    if (isHoliday) {
+      writeCell(isoWs, isoGrandRow, 2 + i, 'H', { ...GRAND_TOTAL_STYLE, font: { bold: true, color: { rgb: 'FF4338CA' } } });
+    } else {
+      const v = Number(t.toFixed(2));
+      isoGrandSum += t;
+      writeCell(isoWs, isoGrandRow, 2 + i, v, GRAND_TOTAL_STYLE);
+    }
   });
   writeCell(isoWs, isoGrandRow, isoGrandCol, Number(isoGrandSum.toFixed(2)), GRAND_TOTAL_STYLE);
 
@@ -511,10 +530,118 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   dates.forEach(() => isoCols.push({ wch: 9 }));
   isoCols.push({ wch: 12 });
   isoWs['!cols'] = isoCols;
-  isoWs['!freeze'] = { xSplit: 2, ySplit: 3 };
+  isoWs['!views'] = [{ state: 'frozen', xSplit: 2, ySplit: 3 }];
 
   // ════════════════════════════════════════════════════════
-  // SHEET 4 — "Leaves" (absent weekdays per person)
+  // SHEET 4 — "Break Time" (pivot of break hours per person per day)
+  // ════════════════════════════════════════════════════════
+  const breakWs = {};
+
+  // Row 0 — day-of-week / Holiday labels
+  dates.forEach((ds, i) => {
+    const dow = dateFromStr(ds).getDay();
+    if (holidayMap[ds]) {
+      writeCell(breakWs, 0, 2 + i, 'Holiday', HOLIDAY_LABEL_STYLE);
+    } else if (dow === 0) {
+      writeCell(breakWs, 0, 2 + i, 'Sunday', DOW_LABEL_STYLE);
+    } else if (dow === 6) {
+      writeCell(breakWs, 0, 2 + i, 'Saturday', DOW_LABEL_STYLE);
+    } else {
+      writeCell(breakWs, 0, 2 + i, '', DOW_LABEL_STYLE);
+    }
+  });
+
+  // Row 1 — title pair
+  writeCell(breakWs, 1, 0, 'Break Time', {
+    font: { bold: true, color: { rgb: 'FF64748B' }, sz: 10 },
+    alignment: { horizontal: 'left' },
+  });
+  writeCell(breakWs, 1, 1, '(gaps > 5 min)', {
+    font: { italic: true, color: { rgb: 'FF94A3B8' }, sz: 9 },
+    alignment: { horizontal: 'left' },
+  });
+
+  // Row 2 — header: Name | (blank) | date1 | ... | Grand Total
+  writeCell(breakWs, 2, 0, 'Name', HEADER_STYLE);
+  writeCell(breakWs, 2, 1, '', HEADER_STYLE);
+  dates.forEach((ds, i) => {
+    writeCell(breakWs, 2, 2 + i, dateFromStr(ds), { ...HEADER_STYLE, numFmt: 'dd-mmm' });
+  });
+  const breakGrandCol = 2 + dates.length;
+  writeCell(breakWs, 2, breakGrandCol, 'Total (h)', HEADER_STYLE);
+
+  // Per-person rows
+  const breakColTotals = new Array(dates.length).fill(0);
+  names.forEach((name, nIdx) => {
+    const r = 3 + nIdx;
+    writeCell(breakWs, r, 0, name, NAME_CELL_STYLE);
+    writeCell(breakWs, r, 1, '', BLANK_CELL_STYLE);
+
+    let personTotal = 0;
+    dates.forEach((ds, dIdx) => {
+      const entry = lookup[`${name}|${ds}`];
+      const col = 2 + dIdx;
+      if (holidayMap[ds]) {
+        writeCell(breakWs, r, col, 'H', HOLIDAY_CELL_STYLE);
+        return;
+      }
+      const brkH = entry?.breakHours || 0;
+      if (brkH > 0) {
+        const h = Number(brkH.toFixed(2));
+        // Red if > 2h, Orange if > 1h, normal otherwise
+        let style = NUM_CELL_STYLE;
+        if (brkH > 2) style = RED_STYLE;
+        else if (brkH > 1) style = ORANGE_STYLE;
+        writeCell(breakWs, r, col, h, style);
+        personTotal += brkH;
+        breakColTotals[dIdx] += brkH;
+      } else {
+        writeCell(breakWs, r, col, '', BLANK_CELL_STYLE);
+      }
+    });
+
+    // Person total
+    const totalRounded = Number(personTotal.toFixed(2));
+    const totalStyle = personTotal > 10 ? RED_STYLE : GRAND_TOTAL_STYLE;
+    writeCell(breakWs, r, breakGrandCol, totalRounded, totalStyle);
+  });
+
+  // Grand Total row
+  const breakGrandRow = 3 + names.length;
+  writeCell(breakWs, breakGrandRow, 0, 'Grand Total', GRAND_TOTAL_STYLE);
+  writeCell(breakWs, breakGrandRow, 1, '', GRAND_TOTAL_STYLE);
+  let breakGrandSum = 0;
+  breakColTotals.forEach((t, i) => {
+    const ds = dates[i];
+    const isHoliday = !!holidayMap[ds];
+    if (isHoliday) {
+      writeCell(breakWs, breakGrandRow, 2 + i, 'H', { ...GRAND_TOTAL_STYLE, font: { bold: true, color: { rgb: 'FF4338CA' } } });
+    } else {
+      const v = Number(t.toFixed(2));
+      breakGrandSum += t;
+      writeCell(breakWs, breakGrandRow, 2 + i, v, GRAND_TOTAL_STYLE);
+    }
+  });
+  writeCell(breakWs, breakGrandRow, breakGrandCol, Number(breakGrandSum.toFixed(2)), GRAND_TOTAL_STYLE);
+
+  // Legend
+  const breakNoteStart = breakGrandRow + 2;
+  writeCell(breakWs, breakNoteStart,     0, 'Note:', NOTE_LABEL_STYLE);
+  writeCell(breakWs, breakNoteStart,     1, 'Break = gaps > 5 min between snapshots', NOTE_VALUE_STYLE);
+  writeCell(breakWs, breakNoteStart + 1, 1, 'Orange', LEGEND_ORANGE_STYLE);
+  writeCell(breakWs, breakNoteStart + 1, 2, '1 – 2 hours break (watch list)', NOTE_VALUE_STYLE);
+  writeCell(breakWs, breakNoteStart + 2, 1, 'Red', LEGEND_RED_STYLE);
+  writeCell(breakWs, breakNoteStart + 2, 2, '> 2 hours break (flag)', NOTE_VALUE_STYLE);
+
+  // Column widths
+  const breakCols = [{ wch: 24 }, { wch: 4 }];
+  dates.forEach(() => breakCols.push({ wch: 9 }));
+  breakCols.push({ wch: 12 });
+  breakWs['!cols'] = breakCols;
+  breakWs['!views'] = [{ state: 'frozen', xSplit: 2, ySplit: 3 }];
+
+  // ════════════════════════════════════════════════════════
+  // SHEET 5 — "Leaves" (absent weekdays per person)
   // ════════════════════════════════════════════════════════
   const leaveWs = {};
 
@@ -536,8 +663,11 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
     const absentDates = [];
     weekdays.forEach(ds => {
       const entry = lookup[`${name}|${ds}`];
-      // Count as present if they logged at least ~1 hour
-      if (entry && entry.hours >= 1) {
+      // Bug fix: Use same threshold as on-screen Leaves tab (4 hours = Half Day or better)
+      // Also check backend status if available
+      const status = entry?.status?.toLowerCase();
+      const isPresent = status ? (status === 'present' || status === 'half_day') : (entry && entry.hours >= 4);
+      if (isPresent) {
         present++;
       } else {
         absentDates.push(ds);
@@ -588,7 +718,7 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   leaveWs['!cols'] = [
     { wch: 24 }, { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 14 }, { wch: 60 },
   ];
-  leaveWs['!freeze'] = { xSplit: 1, ySplit: 1 };
+  leaveWs['!views'] = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
 
   // ════════════════════════════════════════════════════════
   // Assemble and download
@@ -597,6 +727,7 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
   const mon3 = monthName.slice(0, 3);
   XLSX.utils.book_append_sheet(wb, pivotWs,  `${mon3} ${year} Pivot`);
   XLSX.utils.book_append_sheet(wb, isoWs,    `${mon3} ${year} Isolation`);
+  XLSX.utils.book_append_sheet(wb, breakWs,  `${mon3} ${year} Break Time`);
   XLSX.utils.book_append_sheet(wb, leaveWs,  `${mon3} ${year} Leaves`);
   XLSX.utils.book_append_sheet(wb, dataWs,   `${mon3} ${year} Data`);
 

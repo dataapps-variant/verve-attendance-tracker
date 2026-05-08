@@ -80,6 +80,7 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
         hours: mins / 60,
         isolationHours: isoMins / 60,
         breakHours: brkMins / 60,
+        status: r.status || null,  // Bug fix: Store status from backend
       };
     });
 
@@ -452,15 +453,21 @@ function LeavesTable({ dates, weekdays, names, lookup, holidayMap = {} }) {
   const holidayCount = Object.keys(holidayMap).length;
   const workingDays = weekdays.length; // weekdays excludes holidays
 
-  // Per-person leave count (only counts non-holiday weekdays with hours < 1)
+  // Per-person leave count (counts non-holiday weekdays where status is Absent)
+  // Threshold: >= 4 hours = Present/Half Day (P), < 4 hours = Leave (L)
+  const PRESENT_THRESHOLD_HOURS = 4; // Matches backend Half Day threshold (240 mins)
   const leaveCountByName = {};
   const presentCountByName = {};
   names.forEach(name => {
     let leaves = 0;
     let present = 0;
     weekdays.forEach(ds => {
-      const h = lookup[`${name}|${ds}`]?.hours || 0;
-      if (h >= 1) present++;
+      const entry = lookup[`${name}|${ds}`];
+      const h = entry?.hours || 0;
+      const status = entry?.status?.toLowerCase();
+      // Use backend status if available, otherwise check hours threshold
+      const isPresent = status ? (status === 'present' || status === 'half_day') : (h >= PRESENT_THRESHOLD_HOURS);
+      if (isPresent) present++;
       else leaves++;
     });
     leaveCountByName[name] = leaves;
@@ -471,8 +478,11 @@ function LeavesTable({ dates, weekdays, names, lookup, holidayMap = {} }) {
   const colLeaveTotals = dates.map(ds => {
     if (holidayMap[ds]) return null; // holiday column
     return names.reduce((acc, name) => {
-      const h = lookup[`${name}|${ds}`]?.hours || 0;
-      return acc + (h >= 1 ? 0 : 1);
+      const entry = lookup[`${name}|${ds}`];
+      const h = entry?.hours || 0;
+      const status = entry?.status?.toLowerCase();
+      const isPresent = status ? (status === 'present' || status === 'half_day') : (h >= PRESENT_THRESHOLD_HOURS);
+      return acc + (isPresent ? 0 : 1);
     }, 0);
   });
 
@@ -539,8 +549,12 @@ function LeavesTable({ dates, weekdays, names, lookup, holidayMap = {} }) {
                         >H</td>
                       );
                     }
-                    const h = lookup[`${name}|${ds}`]?.hours || 0;
-                    if (h >= 1) {
+                    const entry = lookup[`${name}|${ds}`];
+                    const h = entry?.hours || 0;
+                    const status = entry?.status?.toLowerCase();
+                    // Use backend status if available, otherwise check hours threshold
+                    const isPresent = status ? (status === 'present' || status === 'half_day') : (h >= PRESENT_THRESHOLD_HOURS);
+                    if (isPresent) {
                       return (
                         <td
                           key={ds}
