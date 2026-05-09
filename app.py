@@ -7933,9 +7933,9 @@ def team_attendance(team_id, date):
             meeting_dur = r.meeting_duration_mins if r.meeting_duration_mins else 0
 
             # Cap main_fill to prevent phantom time from webhook span inflation.
+            # Use 120-minute cap (same as attendance_summary endpoint).
             if r.total_active_mins > 0:
-                max_main_fill = max(60, int(r.total_active_mins * 0.2))
-                main_fill = min(main_fill, max_main_fill)
+                main_fill = min(main_fill, 120)
 
             main_room = main_fill + main_snapshot
             # Combine tracked active time with webhook gap-fill for untracked main room.
@@ -8408,9 +8408,10 @@ def team_attendance_range(team_id):
             breakout_mins = r.breakout_active_mins if hasattr(r, 'breakout_active_mins') and r.breakout_active_mins else r.active_mins
 
             # Cap main_fill to prevent phantom time from webhook span inflation.
+            # Use 120-minute cap (same as attendance_summary endpoint) instead of
+            # percentage-based cap which was too restrictive.
             if r.active_mins > 0:
-                max_main_fill = max(60, int(r.active_mins * 0.2))
-                main_fill = min(main_fill, max_main_fill)
+                main_fill = min(main_fill, 120)
 
             main_room = main_fill + main_snapshot
             total_mins = r.active_mins + main_fill if r.active_mins > 0 else meeting_dur
