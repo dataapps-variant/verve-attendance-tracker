@@ -349,10 +349,12 @@ export default function EmployeeManager({ user }) {
                         <tr key={i} style={i % 2 === 0 ? s.trEven : {}}>
                           <td style={s.td}>{d.date}</td>
                           <td style={s.td}>
-                            <span style={{ ...s.badge,
-                              background: d.status === 'Present' ? '#dcfce7' : d.status === 'Half Day' ? '#fef3c7' : '#fef2f2',
-                              color: d.status === 'Present' ? '#15803d' : d.status === 'Half Day' ? '#92400e' : '#dc2626'
-                            }}>{d.status}</span>
+                            {(() => {
+                              const st = (d.status || '').toLowerCase();
+                              const bg = st === 'present' ? '#dcfce7' : st === 'half_day' ? '#fef3c7' : '#fef2f2';
+                              const fg = st === 'present' ? '#15803d' : st === 'half_day' ? '#92400e' : '#dc2626';
+                              return <span style={{ ...s.badge, background: bg, color: fg }}>{d.status}</span>;
+                            })()}
                           </td>
                           <td style={s.td}>{d.first_seen_ist || '-'}</td>
                           <td style={s.td}>{d.last_seen_ist || '-'}</td>

@@ -123,7 +123,7 @@ export default function ReportBuilder({ user }) {
       const active = d.active_minutes || 0;
       return {
         ...d,
-        status: active >= 300 ? 'Present' : active >= 240 ? 'Half Day' : 'Absent',
+        status: active >= 300 ? 'present' : active >= 240 ? 'half_day' : 'absent',
       };
     });
 
@@ -368,9 +368,11 @@ export default function ReportBuilder({ user }) {
                       let val = r[k] ?? '-';
                       let style = s.td;
                       if (k === 'status') {
-                        const color = val === 'Present' ? '#15803d' : val === 'Half Day' ? '#92400e' : '#dc2626';
-                        const bg = val === 'Present' ? '#dcfce7' : val === 'Half Day' ? '#fef3c7' : '#fef2f2';
-                        return <td key={k} style={style}><span style={{ padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600, background: bg, color }}>{val}</span></td>;
+                        const st = (val || '').toLowerCase();
+                        const color = st === 'present' ? '#15803d' : st === 'half_day' ? '#92400e' : '#dc2626';
+                        const bg = st === 'present' ? '#dcfce7' : st === 'half_day' ? '#fef3c7' : '#fef2f2';
+                        const label = st === 'present' ? 'Present' : st === 'half_day' ? 'Half Day' : 'Absent';
+                        return <td key={k} style={style}><span style={{ padding: '2px 8px', borderRadius: 10, fontSize: 11, fontWeight: 600, background: bg, color }}>{label}</span></td>;
                       }
                       if (['active_minutes', 'break_minutes', 'isolation_minutes'].includes(k)) {
                         val = typeof val === 'number' ? val : parseInt(val) || 0;
