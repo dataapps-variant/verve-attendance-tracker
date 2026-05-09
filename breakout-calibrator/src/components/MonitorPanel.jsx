@@ -3,6 +3,9 @@ import useZoomSdk from '../hooks/useZoomSdk';
 import axios from 'axios';
 
 const POLL_INTERVAL_MS = 30000; // 30 seconds
+const START_RETRY_MS = 10000;
+const WATCHDOG_INTERVAL_MS = 15000;
+const STALE_AFTER_MS = POLL_INTERVAL_MS * 3;
 
 const getBackendUrl = () => {
   if (process.env.REACT_APP_BACKEND_URL) return process.env.REACT_APP_BACKEND_URL;
@@ -56,7 +59,11 @@ function MonitorPanel() {
   const [roomSummary, setRoomSummary] = useState([]);
 
   const intervalRef = useRef(null);
+  const watchdogRef = useRef(null);
   const meetingIdRef = useRef(null);
+  const isMonitoringRef = useRef(false);
+  const isStartingRef = useRef(false);
+  const lastSuccessRef = useRef(null);
 
   const addLog = useCallback((msg) => {
     const time = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
@@ -153,10 +160,12 @@ function MonitorPanel() {
       });
 
       if (response.data.success) {
+        const now = new Date();
+        lastSuccessRef.current = now;
         setPollCount(prev => prev + 1);
         setRoomCount(rooms.length);
         setParticipantCount(totalParticipants);
-        setLastPoll(new Date());
+        setLastPoll(now);
         setRoomSummary(roomData.map(r => ({
           name: r.room_name,
           count: r.participants.length
@@ -174,9 +183,10 @@ function MonitorPanel() {
 
   // Start monitoring
   const startMonitoring = useCallback(async () => {
-    if (isMonitoring) return;
+    if (isMonitoringRef.current || isStartingRef.current) return;
 
     try {
+      isStartingRef.current = true;
       const uuid = await getMeetingUUID();
 
       // Try multiple sources for meeting ID
@@ -213,6 +223,12 @@ function MonitorPanel() {
       addLog(`Starting monitor for meeting ${meetingIdRef.current}`);
       addLog(`Meeting UUID: ${uuid}`);
 
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+
+      isMonitoringRef.current = true;
       setIsMonitoring(true);
       setErrors([]);
 
@@ -224,8 +240,12 @@ function MonitorPanel() {
       addLog(`Polling every ${POLL_INTERVAL_MS / 1000}s`);
     } catch (err) {
       addLog(`Failed to start: ${err.message}`);
+      isMonitoringRef.current = false;
+      setIsMonitoring(false);
+    } finally {
+      isStartingRef.current = false;
     }
-  }, [isMonitoring, getMeetingUUID, meetingContext, doPoll, addLog]);
+  }, [getMeetingUUID, meetingContext, doPoll, addLog]);
 
   // Stop monitoring
   const stopMonitoring = useCallback(() => {
@@ -233,6 +253,8 @@ function MonitorPanel() {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
+    isMonitoringRef.current = false;
+    isStartingRef.current = false;
     setIsMonitoring(false);
     addLog('Monitoring stopped');
   }, [addLog]);
@@ -241,6 +263,7 @@ function MonitorPanel() {
   useEffect(() => {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
+      if (watchdogRef.current) clearInterval(watchdogRef.current);
     };
   }, []);
 
@@ -257,14 +280,55 @@ function MonitorPanel() {
     }
   }, [isConfigured, isHost, retryCount, refreshUserRole]);
 
-  // AUTO-START: Begin monitoring as soon as SDK is ready and user is host/co-host
+  // AUTO-START: Begin monitoring as soon as SDK is ready.
+  // Zoom's user role can be delayed or inconsistent, so after a few role refreshes
+  // we start optimistically and let the SDK calls prove whether access is allowed.
   useEffect(() => {
-    if (isConfigured && isHost && !isMonitoring && !autoStarted) {
+    const roleRetriesDone = retryCount >= 3;
+    const shouldStart = isConfigured && (isHost || roleRetriesDone) && !isMonitoringRef.current && !isStartingRef.current;
+
+    if (shouldStart && !autoStarted) {
       setAutoStarted(true);
-      addLog('Auto-starting monitor (host/co-host detected)');
-      setTimeout(() => startMonitoring(), 2000);
+      addLog(isHost ? 'Auto-starting monitor (host/co-host detected)' : 'Auto-starting monitor after role retries');
+      const timer = setTimeout(() => startMonitoring(), 2000);
+      return () => clearTimeout(timer);
     }
-  }, [isConfigured, isHost, isMonitoring, autoStarted, startMonitoring, addLog]);
+  }, [isConfigured, isHost, retryCount, autoStarted, startMonitoring, addLog]);
+
+  // WATCHDOG: keep monitoring alive while the Zoom App panel is loaded.
+  useEffect(() => {
+    if (!isConfigured) return;
+
+    watchdogRef.current = setInterval(() => {
+      if (isStartingRef.current) return;
+
+      const lastSuccess = lastSuccessRef.current?.getTime?.() || 0;
+      const stale = isMonitoringRef.current && lastSuccess > 0 && Date.now() - lastSuccess > STALE_AFTER_MS;
+      const missingTimer = isMonitoringRef.current && !intervalRef.current;
+
+      if (!isMonitoringRef.current || stale || missingTimer) {
+        if (stale) addLog('Watchdog: snapshot stale, restarting monitor');
+        if (missingTimer) addLog('Watchdog: polling timer missing, restarting monitor');
+        if (!isMonitoringRef.current) addLog('Watchdog: monitor is idle, starting monitor');
+
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+        isMonitoringRef.current = false;
+        setIsMonitoring(false);
+        setAutoStarted(false);
+        setTimeout(() => startMonitoring(), START_RETRY_MS);
+      }
+    }, WATCHDOG_INTERVAL_MS);
+
+    return () => {
+      if (watchdogRef.current) {
+        clearInterval(watchdogRef.current);
+        watchdogRef.current = null;
+      }
+    };
+  }, [isConfigured, startMonitoring, addLog]);
 
   // Not configured
   if (!isConfigured) {

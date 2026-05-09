@@ -10,8 +10,8 @@ Write-Host "`n[1/6] Creating C:\ScoutBot directory..." -ForegroundColor Yellow
 New-Item -ItemType Directory -Path "C:\ScoutBot" -Force | Out-Null
 Write-Host "Done!" -ForegroundColor Green
 
-# 2. Create join_meeting.bat
-Write-Host "`n[2/6] Creating join_meeting.bat..." -ForegroundColor Yellow
+# 2. Create join_meeting.bat and watchdog launcher
+Write-Host "`n[2/6] Creating join_meeting.bat and watchdog launcher..." -ForegroundColor Yellow
 $meetingId = Read-Host "Enter your Zoom Meeting ID (numbers only)"
 $meetingPwd = Read-Host "Enter your Zoom Meeting Password"
 
@@ -26,10 +26,24 @@ start zoommtg://zoom.us/join?confno=$meetingId&pwd=$meetingPwd
 $batContent | Out-File -FilePath "C:\ScoutBot\join_meeting.bat" -Encoding ASCII
 Write-Host "Created C:\ScoutBot\join_meeting.bat" -ForegroundColor Green
 
-# 3. Create scheduled task for 9:55 AM daily
-Write-Host "`n[3/6] Creating scheduled task for 9:55 AM daily..." -ForegroundColor Yellow
+$watchdogScript = Join-Path $PSScriptRoot "scout_bot_watchdog.ps1"
+if (Test-Path $watchdogScript) {
+    Copy-Item $watchdogScript "C:\ScoutBot\scout_bot_watchdog.ps1" -Force
+}
+
+$watchdogLauncher = @"
+@echo off
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\ScoutBot\scout_bot_watchdog.ps1" -MeetingId "$meetingId" -MeetingPwd "$meetingPwd"
+"@
+
+$watchdogLauncher | Out-File -FilePath "C:\ScoutBot\start_watchdog.bat" -Encoding ASCII
+Write-Host "Created C:\ScoutBot\start_watchdog.bat" -ForegroundColor Green
+
+# 3. Create scheduled tasks
+Write-Host "`n[3/6] Creating scheduled tasks..." -ForegroundColor Yellow
 schtasks /create /tn "ScoutBot-JoinMeeting" /tr "C:\ScoutBot\join_meeting.bat" /sc daily /st 09:55 /f
-Write-Host "Scheduled task created!" -ForegroundColor Green
+schtasks /create /tn "ScoutBot-ZoomWatchdog" /tr "C:\ScoutBot\start_watchdog.bat" /sc onlogon /f
+Write-Host "Scheduled tasks created!" -ForegroundColor Green
 
 # 4. Configure auto-login
 Write-Host "`n[4/6] Configuring auto-login..." -ForegroundColor Yellow
@@ -65,5 +79,6 @@ MANUAL STEPS REMAINING:
 4. In Zoom Marketplace app settings, enable 'Enable the app when a meeting starts'
 5. Reboot the VM to test auto-login
 
-The VM will auto-join your meeting every day at 9:55 AM IST!
+The VM will auto-join your meeting every day at 9:55 AM IST.
+The watchdog will also run at login and reopen the meeting if Zoom closes.
 "@ -ForegroundColor White
