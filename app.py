@@ -8734,14 +8734,34 @@ def team_monthly_report(team_id):
             AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
             AND rs.room_name IS NOT NULL AND rs.room_name != ''
             AND LOWER(rs.participant_name) NOT LIKE '%scout%'
-            AND LOWER(rs.room_name) != 'main room'
-            AND LOWER(rs.room_name) NOT LIKE '0.main%'
+            AND LOWER(rs.room_name) NOT LIKE '%break time%'
           QUALIFY ROW_NUMBER() OVER (
             PARTITION BY rs.event_date,
               COALESCE(ntk.participant_key, NULLIF(rs.participant_uuid, ''), NULLIF(LOWER(TRIM(rs.participant_email)), ''), LOWER(TRIM(rs.participant_name))),
               rs.snapshot_time
-            ORDER BY rs.room_name
+            ORDER BY
+              CASE WHEN LOWER(rs.room_name) = 'main room' OR LOWER(rs.room_name) LIKE '0.main%' THEN 1 ELSE 0 END,
+              rs.room_name
           ) = 1
+        ),
+        -- Break time from BREAK TIME room visits (separate CTE since snapshot_clean excludes them)
+        break_room_time AS (
+          SELECT
+            rs.event_date,
+            COALESCE(
+              ntk.participant_key,
+              NULLIF(rs.participant_uuid, ''),
+              NULLIF(LOWER(TRIM(rs.participant_email)), ''),
+              LOWER(TRIM(rs.participant_name))
+            ) as participant_key,
+            COUNT(*) * 0.5 as break_room_mins
+          FROM `{dataset_ref}.room_snapshots` rs
+          LEFT JOIN name_to_key ntk ON rs.event_date = ntk.event_date AND LOWER(TRIM(rs.participant_name)) = ntk.name_key
+          WHERE rs.event_date >= @start_date AND rs.event_date <= @end_date
+            AND rs.participant_name IS NOT NULL AND rs.participant_name != ''
+            AND LOWER(rs.participant_name) NOT LIKE '%scout%'
+            AND LOWER(rs.room_name) LIKE '%break time%'
+          GROUP BY rs.event_date, participant_key
         ),
         ordered_snaps AS (
           SELECT *,
@@ -8757,7 +8777,7 @@ def team_monthly_report(team_id):
             MAX(participant_email) as participant_email,
             TIMESTAMP_ADD(MIN(snapshot_time), INTERVAL 330 MINUTE) as first_seen,
             TIMESTAMP_ADD(MAX(snapshot_time), INTERVAL 330 MINUTE) as last_seen,
-            -- Total active time from breakout rooms (interval-sum)
+            -- Total active time (interval-sum) - includes Main Room and breakout rooms
             CEILING(SUM(
               CASE
                 WHEN prev_snapshot IS NULL THEN 0
@@ -8766,22 +8786,13 @@ def team_monthly_report(team_id):
                 ELSE 0
               END
             )) as total_mins,
-            -- Break time
+            -- Breakout room time (excluding main room)
             CEILING(SUM(
               CASE
                 WHEN prev_snapshot IS NULL THEN 0
                 WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
-                     AND LOWER(room_name) LIKE '%break time%' THEN
-                  TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
-                ELSE 0
-              END
-            )) as break_mins,
-            -- Breakout room time (excluding break time rooms)
-            CEILING(SUM(
-              CASE
-                WHEN prev_snapshot IS NULL THEN 0
-                WHEN TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) <= 300
-                     AND NOT LOWER(room_name) LIKE '%break time%' THEN
+                     AND LOWER(room_name) != 'main room'
+                     AND LOWER(room_name) NOT LIKE '0.main%' THEN
                   TIMESTAMP_DIFF(snapshot_time, prev_snapshot, SECOND) / 60.0
                 ELSE 0
               END
@@ -8789,12 +8800,11 @@ def team_monthly_report(team_id):
           FROM ordered_snaps
           GROUP BY event_date, participant_key
         ),
-        -- Isolation time (alone in room)
+        -- Isolation time (alone in room) - snapshot_clean already excludes Break Time rooms
         room_occupancy AS (
           SELECT event_date, snapshot_time, room_name,
             COUNT(DISTINCT participant_key) as occupant_count
           FROM snapshot_clean
-          WHERE NOT LOWER(room_name) LIKE '%break time%'
           GROUP BY event_date, snapshot_time, room_name
         ),
         daily_isolation AS (
@@ -8806,7 +8816,6 @@ def team_monthly_report(team_id):
           INNER JOIN room_occupancy ro
             ON sc.event_date = ro.event_date AND sc.snapshot_time = ro.snapshot_time AND sc.room_name = ro.room_name
           WHERE ro.occupant_count = 1
-            AND NOT LOWER(sc.room_name) LIKE '%break time%'
           GROUP BY sc.event_date, sc.participant_key
         )
         SELECT
@@ -8817,9 +8826,10 @@ def team_monthly_report(team_id):
           FORMAT_TIMESTAMP('%H:%M', ds.last_seen) as last_seen_ist,
           ds.total_mins,
           ds.breakout_mins,
-          ds.break_mins,
+          COALESCE(brt.break_room_mins, 0) as break_mins,
           COALESCE(di.isolation_mins, 0) as isolation_mins
         FROM daily_stats ds
+        LEFT JOIN break_room_time brt ON ds.event_date = brt.event_date AND ds.participant_key = brt.participant_key
         LEFT JOIN daily_isolation di ON ds.event_date = di.event_date AND ds.participant_key = di.participant_key
         ORDER BY ds.participant_name, ds.event_date
         """
