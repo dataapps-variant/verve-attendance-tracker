@@ -77,10 +77,10 @@ export default function MonthlyPivotTables({ monthlyData, year, month, holidays 
       const isoMins = Number(r.isolation_minutes) || 0;
       const brkMins = Number(r.break_minutes) || 0;
       lookupMap[`${r.name}|${r.date}`] = {
-        hours: mins / 60,
+        hours: mins / 60,              // active_minutes already excludes break time
         isolationHours: isoMins / 60,
         breakHours: brkMins / 60,
-        status: r.status || null,  // Bug fix: Store status from backend
+        status: r.status || null,
       };
     });
 

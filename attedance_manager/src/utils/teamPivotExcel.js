@@ -231,13 +231,14 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
     const brkMins = Number(r.break_minutes) || 0;
     lookup[`${r.name}|${r.date}`] = {
       minutes: mins,
-      hours: mins / 60,
+      hours: mins / 60,  // active_minutes already excludes break time
       isolationMinutes: isoMins,
       isolationHours: isoMins / 60,
       breakMinutes: brkMins,
       breakHours: brkMins / 60,
       first: r.first_seen_ist || '',
       last: r.last_seen_ist || '',
+      status: r.status || null,
     };
   });
 
@@ -663,8 +664,7 @@ export function downloadTeamPivotExcel(monthlyData, team, year, month) {
     const absentDates = [];
     weekdays.forEach(ds => {
       const entry = lookup[`${name}|${ds}`];
-      // Bug fix: Use same threshold as on-screen Leaves tab (4 hours = Half Day or better)
-      // Also check backend status if available
+      // Use backend status if available, otherwise check hours threshold (4h = half day)
       const status = entry?.status?.toLowerCase();
       const isPresent = status ? (status === 'present' || status === 'half_day') : (entry && entry.hours >= 4);
       if (isPresent) {
